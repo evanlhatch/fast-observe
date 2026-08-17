@@ -102,18 +102,86 @@ impl Context {
 /// A frame in the fault causal tree.
 /// Frame tree for crash dumps and doctor-style tooling. Full detail belongs
 /// in the app's journal/log.
+///
+/// Fields are crate-private: every frame is born in [`Frame::capture`] (root
+/// frames — hook + counter fan-out) or [`frame_from_error`] (child frames).
+/// Hand-constructed frames would bypass the invariants the report relies on.
 #[derive(Debug)]
 pub struct Frame {
+    pub(crate) error: BoxError,
+    pub(crate) location: &'static Location<'static>,
+    pub(crate) context: Context,
+    pub(crate) children: Vec<Arc<Frame>>,
+    pub(crate) type_name: &'static str,
+}
+
+impl Frame {
+    /// The single root-frame construction path: auto scope context, nested
+    /// source chain, hook + counter fan-out. Every `Fault` root is born here
+    /// — exactly one hook firing per constructed frame.
+    #[cold]
+    fn capture(
+        error: BoxError,
+        type_name: &'static str,
+        location: &'static Location<'static>,
+    ) -> Arc<Frame> {
+        let context = crate::profiling::current_scope_name().map_or(Context::None, Context::Scope);
+        let children = walk_sources(&*error, location);
+        let frame = Arc::new(Frame {
+            error,
+            location,
+            context,
+            children,
+            type_name,
+        });
+        crate::hook::invoke(&frame);
+        frame
+    }
+
     /// The error at this frame.
-    pub error: BoxError,
+    #[must_use]
+    pub fn error(&self) -> &(dyn Error + Send + Sync + 'static) {
+        &*self.error
+    }
     /// Where this frame was created (`#[track_caller]`).
-    pub location: &'static Location<'static>,
+    #[must_use]
+    pub fn location(&self) -> &'static Location<'static> {
+        self.location
+    }
     /// Typed context — what was happening when the error occurred.
-    pub context: Context,
+    #[must_use]
+    pub fn context(&self) -> &Context {
+        &self.context
+    }
     /// Child frames (the cause chain + raised contexts).
-    pub children: Vec<Arc<Frame>>,
+    #[must_use]
+    pub fn children(&self) -> &[Arc<Frame>] {
+        &self.children
+    }
     /// The type name of the error (for doctor-style debugging).
-    pub type_name: &'static str,
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+}
+
+/// A child frame for an error entering the tree via wrap/context APIs —
+/// nested source chain, NO hook: the hook fires at the root's capture
+/// (children are causes, not new constructions).
+#[cold]
+fn frame_from_error(
+    error: BoxError,
+    type_name: &'static str,
+    location: &'static Location<'static>,
+) -> Arc<Frame> {
+    let children = walk_sources(&*error, location);
+    Arc::new(Frame {
+        error,
+        location,
+        context: Context::None,
+        children,
+        type_name,
+    })
 }
 
 impl fmt::Display for Frame {
@@ -184,19 +252,20 @@ impl Fault<SimpleError> {
     #[track_caller]
     #[cold]
     pub fn from_boxed(error: BoxError) -> Self {
-        let location = Location::caller();
-        let context = crate::profiling::current_scope_name().map_or(Context::None, Context::Scope);
+        Self::capture_boxed(error, Location::caller())
+    }
+
+    /// The single boxed construction path — see [`Frame::capture`].
+    #[cold]
+    fn capture_boxed(error: BoxError, location: &'static Location<'static>) -> Self {
         let type_name = std::any::type_name_of_val(&*error);
         let error = Arc::new(error);
-        let frame = Arc::new(Frame {
-            error: Box::new(SharedBoxedError(Arc::clone(&error))),
-            location,
-            context,
-            children: Vec::new(),
+        let root = Frame::capture(
+            Box::new(SharedBoxedError(Arc::clone(&error))),
             type_name,
-        });
-        crate::hook::invoke(&frame);
-        Self { root: frame, error }
+            location,
+        );
+        Self { root, error }
     }
 }
 
@@ -210,7 +279,7 @@ impl From<&str> for Fault<SimpleError> {
 impl From<String> for Fault<SimpleError> {
     #[track_caller]
     fn from(msg: String) -> Self {
-        Self::from_boxed(Box::new(InternalError(msg.into())))
+        Self::from_boxed(internal_err(msg))
     }
 }
 
@@ -219,26 +288,35 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     #[track_caller]
     #[cold]
     pub fn new(error: E) -> Self {
-        let location = Location::caller();
-        let type_name = std::any::type_name::<E>();
-        let children = walk_sources(&error, location);
-        let context = crate::profiling::current_scope_name().map_or(Context::None, Context::Scope);
+        Self::capture_typed(error, Location::caller())
+    }
+
+    /// The single typed construction path — see [`Frame::capture`].
+    #[cold]
+    fn capture_typed(error: E, location: &'static Location<'static>) -> Self {
         let error = Arc::new(error);
-        let frame = Arc::new(Frame {
-            error: Box::new(SharedError(Arc::clone(&error))),
+        let root = Frame::capture(
+            Box::new(SharedError(Arc::clone(&error))),
+            std::any::type_name::<E>(),
             location,
-            context,
-            children,
-            type_name,
-        });
-        crate::hook::invoke(&frame);
-        Self { root: frame, error }
+        );
+        Self { root, error }
     }
 
     /// Attach typed [`Context`] to this fault's root frame.
+    ///
+    /// The root frame must be uniquely owned (the normal case: you just
+    /// constructed the fault or received it by value). On a shared root the
+    /// context would be silently dropped — that is a bug, and debug builds
+    /// say so.
     pub fn with_context(mut self, ctx: Context) -> Self {
         if let Some(frame) = Arc::get_mut(&mut self.root) {
             frame.context = ctx;
+        } else {
+            debug_assert!(
+                Arc::strong_count(&self.root) == 1,
+                "with_context on a shared Fault root — context would be lost"
+            );
         }
         self
     }
@@ -262,27 +340,18 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     }
 
     /// Wrap this fault in another error, preserving the root cause chain.
+    ///
+    /// The hook fires for the NEW root frame (a newly constructed frame —
+    /// its type is counted), but not again for the original fault: it was
+    /// counted at its own construction.
     #[track_caller]
     #[cold]
     pub fn wrap<T: Error + Send + Sync + Sized + 'static>(self, err: T) -> Fault<T> {
-        let location = Location::caller();
-        let type_name = std::any::type_name::<T>();
-        let children = walk_sources(&err, location);
-        let context = crate::profiling::current_scope_name().map_or(Context::None, Context::Scope);
-        let error = Arc::new(err);
-        let mut frame = Arc::new(Frame {
-            error: Box::new(SharedError(Arc::clone(&error))),
-            location,
-            context,
-            children,
-            type_name,
-        });
-        // Attach the original fault as a child — no hook invocation here,
-        // the hook was already fired when the original Fault was created.
-        if let Some(f) = Arc::get_mut(&mut frame) {
-            f.children.push(self.root);
+        let mut fault = Fault::capture_typed(err, Location::caller());
+        if let Some(root) = Arc::get_mut(&mut fault.root) {
+            root.children.push(self.root);
         }
-        Fault { root: frame, error }
+        fault
     }
 }
 
@@ -398,25 +467,16 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
         match self {
             Ok(v) => Ok(v),
             Err(e) => {
-                let msg = msg.into();
-                let context =
-                    crate::profiling::current_scope_name().map_or(Context::None, Context::Scope);
-                let error: Arc<BoxError> = Arc::new(internal_err(msg));
-                let frame = Arc::new(Frame {
-                    error: Box::new(SharedBoxedError(Arc::clone(&error))),
-                    location: Location::caller(),
-                    context,
-                    children: vec![Arc::new(Frame {
-                        error: Box::new(e),
-                        location: Location::caller(),
-                        context: Context::None,
-                        children: Vec::new(),
-                        type_name: std::any::type_name::<E>(),
-                    })],
-                    type_name: "InternalError",
-                });
-                crate::hook::invoke(&frame);
-                Err(Fault { root: frame, error })
+                let location = Location::caller();
+                // The original error becomes a child frame — WITH its nested
+                // source chain (previously dropped). No hook for the child:
+                // it fires at the root's capture below.
+                let child = frame_from_error(Box::new(e), std::any::type_name::<E>(), location);
+                let mut fault = Fault::capture_boxed(internal_err(msg), location);
+                if let Some(root) = Arc::get_mut(&mut fault.root) {
+                    root.children.push(child);
+                }
+                Err(fault)
             }
         }
     }
@@ -427,26 +487,20 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
             Ok(v) => Ok(v),
             Err(e) => {
                 let msg = msg.into();
-                let location = Location::caller();
-                let children = walk_sources(&e, location);
+                // The original error stays the ROOT — the message rides in
+                // the context, and the nested source chain stays as children
+                // (both via the single capture path).
+                let mut fault = Fault::capture_typed(e, Location::caller());
                 let scope = crate::profiling::current_scope_name().unwrap_or(Cow::Borrowed(""));
                 let context = if scope.is_empty() {
                     Context::Custom(msg)
                 } else {
                     Context::Custom(format!("{scope}: {msg}").into())
                 };
-                // Store the original error as the root — the message rides in
-                // the context, and the source chain stays as children.
-                let error = Arc::new(e);
-                let frame = Arc::new(Frame {
-                    error: Box::new(SharedError(Arc::clone(&error))),
-                    location,
-                    context,
-                    children,
-                    type_name: std::any::type_name::<E>(),
-                });
-                crate::hook::invoke(&frame);
-                Err(Fault { root: frame, error })
+                if let Some(root) = Arc::get_mut(&mut fault.root) {
+                    root.context = context;
+                }
+                Err(fault)
             }
         }
     }
@@ -542,20 +596,31 @@ macro_rules! ensure {
 
 // ── Source chain walking ───────────────────────────────────────────────────
 
+/// Walk `error.source()` into a NESTED child chain: the direct source is
+/// the single child, its source is that child's child, and so on — the tree
+/// mirrors causality instead of flattening it into siblings of the root.
+///
+/// Source errors are stringified into [`InternalError`] (std only lends
+/// `&dyn Error`); the original `type_name` is preserved per frame. No hook
+/// fires for these frames — they are causes, not new constructions.
 #[cold]
 fn walk_sources(error: &dyn Error, location: &'static Location<'static>) -> Vec<Arc<Frame>> {
-    let mut children = Vec::new();
+    let mut chain = Vec::new();
     let mut source = error.source();
     while let Some(src) = source {
-        let type_name = std::any::type_name_of_val(src);
-        children.push(Arc::new(Frame {
-            error: Box::new(InternalError(src.to_string().into())),
+        chain.push((std::any::type_name_of_val(src), src.to_string()));
+        source = src.source();
+    }
+    // Fold from the deepest cause outward into a nested chain.
+    let mut children = Vec::new();
+    for (type_name, msg) in chain.into_iter().rev() {
+        children = vec![Arc::new(Frame {
+            error: Box::new(InternalError(msg.into())),
             location,
             context: Context::None,
-            children: Vec::new(),
+            children,
             type_name,
-        }));
-        source = src.source();
+        })];
     }
     children
 }

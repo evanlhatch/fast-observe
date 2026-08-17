@@ -74,8 +74,8 @@ fn fault_with_context_shows_in_display() {
 fn fault_frame_records_type_and_location() {
     let f = Fault::new(TestErr);
     let frame = f.frame();
-    assert!(frame.type_name.ends_with("TestErr"));
-    assert!(frame.location.file().ends_with("exn.rs"));
+    assert!(frame.type_name().ends_with("TestErr"));
+    assert!(frame.location().file().ends_with("exn.rs"));
 }
 
 #[test]
@@ -108,4 +108,81 @@ fn bail_macro_produces_fault_with_message() {
     }
     let err = inner().unwrap_err();
     assert!(err.to_string().contains("bailed 7"));
+}
+
+// ── Causal tree structure: nesting + tree rendering ────────────────────
+
+/// A chainable test error: display name + optional boxed source.
+#[derive(Debug)]
+struct ChainErr(&'static str, Option<Box<ChainErr>>);
+impl fmt::Display for ChainErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl Error for ChainErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.1.as_deref().map(|e| e as &(dyn Error + 'static))
+    }
+}
+/// `chain(&["a", "b", "c"])` = a with source b with source c.
+fn chain(names: &[&'static str]) -> ChainErr {
+    let (first, rest) = names.split_first().unwrap();
+    ChainErr(first, (!rest.is_empty()).then(|| Box::new(chain(rest))))
+}
+
+#[test]
+fn source_chain_nests_instead_of_flattening() {
+    let f = Fault::new(chain(&["top", "mid", "leaf"]));
+    let dbg = format!("{f:?}");
+    // Nested chain: mid is a child of top, leaf a child of mid.
+    assert!(dbg.contains("`-- mid"), "mid should nest under top: {dbg}");
+    assert!(
+        dbg.contains("    `-- leaf"),
+        "leaf should nest under mid: {dbg}"
+    );
+}
+
+#[test]
+fn debug_tree_uses_continuation_prefixes_for_nested_children() {
+    // Chain B becomes a child via wrap; chain A arrives via the wrapper's
+    // own source chain. Tree shape:
+    //   capA
+    //   |-- topA          <- non-last sibling WITH children: needs `|   `
+    //   |   `-- midA
+    //   |       `-- leafA
+    //   `-- outerB
+    //       `-- midB
+    //           `-- leafB
+    let b = Fault::new(chain(&["outerB", "midB", "leafB"]));
+    let big = b.wrap(chain(&["capA", "topA", "midA", "leafA"]));
+    let dbg = format!("{big:?}");
+    assert!(dbg.contains("|-- topA"), "first sibling: {dbg}");
+    assert!(
+        dbg.contains("|   `-- midA"),
+        "non-last sibling's child needs continuation bar: {dbg}"
+    );
+    assert!(
+        dbg.contains("|       `-- leafA"),
+        "continuation bar holds at depth 3 (midA is last child of topA, so spaces after the bar): {dbg}"
+    );
+    assert!(dbg.contains("`-- outerB"), "last sibling: {dbg}");
+    assert!(
+        dbg.contains("    `-- midB"),
+        "last sibling's child gets plain indent: {dbg}"
+    );
+}
+
+#[test]
+fn wrap_msg_preserves_nested_source_chain() {
+    let inner: core::result::Result<(), ChainErr> = Err(chain(&["mid", "leaf"]));
+    let err = inner.wrap_msg("wrapping").unwrap_err();
+    let dbg = format!("{err:?}");
+    assert!(dbg.contains("wrapping"), "wrapper message: {dbg}");
+    // The original error's source chain survives, nested (was: dropped).
+    assert!(dbg.contains("`-- mid"), "original error is a child: {dbg}");
+    assert!(
+        dbg.contains("    `-- leaf"),
+        "original error's source nests beneath it: {dbg}"
+    );
 }

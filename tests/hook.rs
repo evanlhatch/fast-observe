@@ -39,12 +39,12 @@ fn multiple_hooks_all_fire() {
     static B: AtomicUsize = AtomicUsize::new(0);
 
     add_error_hook(|frame| {
-        if frame.type_name.ends_with("FanoutError") {
+        if frame.type_name().ends_with("FanoutError") {
             A.fetch_add(1, Ordering::Relaxed);
         }
     });
     add_error_hook(|frame| {
-        if frame.type_name.ends_with("FanoutError") {
+        if frame.type_name().ends_with("FanoutError") {
             B.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -84,12 +84,12 @@ fn panicking_hook_is_contained_and_later_hooks_still_run() {
     static AFTER: AtomicUsize = AtomicUsize::new(0);
 
     add_error_hook(|frame| {
-        if frame.type_name.ends_with("PanicError") {
+        if frame.type_name().ends_with("PanicError") {
             panic!("deliberate hook panic");
         }
     });
     add_error_hook(|frame| {
-        if frame.type_name.ends_with("PanicError") {
+        if frame.type_name().ends_with("PanicError") {
             AFTER.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -116,7 +116,7 @@ fn throttle_caps_identical_type_hooks_per_second() {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
 
     add_error_hook(|frame| {
-        if frame.type_name.ends_with("ThrottleError") {
+        if frame.type_name().ends_with("ThrottleError") {
             COUNT.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -146,7 +146,7 @@ fn throttle_zero_is_unlimited() {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
 
     add_error_hook(|frame| {
-        if frame.type_name.ends_with("FanoutError") {
+        if frame.type_name().ends_with("FanoutError") {
             COUNT.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -194,7 +194,7 @@ fn default_hook_can_be_disabled_and_reenabled() {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
 
     add_error_hook(|frame| {
-        if frame.type_name.ends_with("DefaultToggleError") {
+        if frame.type_name().ends_with("DefaultToggleError") {
             COUNT.fetch_add(1, Ordering::Relaxed);
         }
     });
