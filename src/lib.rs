@@ -14,13 +14,15 @@ pub use breakdown::{drain_spans, print_breakdown};
 pub use diagnostic::{Diagnostic, Severity, SourceSpan, eprint_diagnostic, render_diagnostic};
 pub use errors::{ERROR_REGISTRY, ErrorRegistryEntry, error_registry, lookup_error};
 pub use exn::{
-    BoxError, Context, ErrorExt, Fault, Frame, InternalError, OptionExt, Result, ResultExt,
-    SimpleError, error_counts,
+    BoxError, Context, ErrorExt, Fault, Frame, FrameIter, InternalError, OptionExt, Result,
+    ResultExt, SimpleError, error_counts,
 };
-pub use hook::{add_error_hook, init};
+pub use hook::{add_error_hook, clear_error_hooks, hooks_len, init, set_default_hook_enabled};
 #[cfg(feature = "instant")]
 pub use profiling::instant::SpanRecord;
-pub use profiling::{all_functions, current_scope_name, skip};
+pub use profiling::{
+    all_functions, current_scope_elapsed_ms, current_scope_name, scope_path, skip,
+};
 
 /// The error category — drives retry/poison/abort policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, derive_more::Display)]

@@ -163,6 +163,36 @@ impl Frame {
     pub fn type_name(&self) -> &'static str {
         self.type_name
     }
+
+    /// Pre-order iterator over this frame and all descendants (self first,
+    /// then children recursively). Explicit-stack implementation, no allocation
+    /// beyond the stack Vec.
+    pub fn iter(self: &Arc<Frame>) -> FrameIter {
+        FrameIter {
+            stack: vec![Arc::clone(self)],
+        }
+    }
+}
+
+/// Pre-order iterator over a [`Frame`] tree — see [`Frame::iter`].
+///
+/// Yields `Arc<Frame>` clones (cheap refcount bumps) so callers can hold
+/// frames past the iterator's borrow.
+pub struct FrameIter {
+    stack: Vec<Arc<Frame>>,
+}
+
+impl Iterator for FrameIter {
+    type Item = Arc<Frame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let frame = self.stack.pop()?;
+        // Push children in reverse so they pop left-to-right.
+        for child in frame.children.iter().rev() {
+            self.stack.push(Arc::clone(child));
+        }
+        Some(frame)
+    }
 }
 
 /// A child frame for an error entering the tree via wrap/context APIs —
@@ -337,6 +367,23 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     #[must_use]
     pub fn into_frame(self) -> Arc<Frame> {
         self.root
+    }
+
+    /// Pre-order iterator over every frame in the causal tree, starting at the root.
+    pub fn iter(&self) -> FrameIter {
+        self.root.iter()
+    }
+
+    /// The deepest frame in the tree — the root cause. For a chain
+    /// A→B→C this is C's frame. With branching children, the deepest
+    /// FIRST-branch frame (depth-first, ties broken toward earlier children).
+    #[must_use]
+    pub fn root_cause(&self) -> Arc<Frame> {
+        let mut frame = Arc::clone(&self.root);
+        while let Some(first) = frame.children().first() {
+            frame = Arc::clone(first);
+        }
+        frame
     }
 
     /// Wrap this fault in another error, preserving the root cause chain.

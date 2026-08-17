@@ -186,3 +186,44 @@ fn wrap_msg_preserves_nested_source_chain() {
         "original error's source nests beneath it: {dbg}"
     );
 }
+
+// ── Tree traversal: iter + root_cause ────────────────────────────────
+
+#[test]
+fn iter_visits_preorder() {
+    let f = Fault::new(chain(&["top", "mid", "leaf"]));
+    let names: Vec<String> = f.iter().map(|fr| fr.error().to_string()).collect();
+    assert_eq!(names, ["top", "mid", "leaf"]);
+}
+
+#[test]
+fn iter_with_branching_visits_all() {
+    // Tree shape:
+    //   capA
+    //   |-- topA -> midA -> leafA   (wrapper's source chain, first child)
+    //   `-- outerB -> midB -> leafB (wrapped fault's root, second child)
+    let b = Fault::new(chain(&["outerB", "midB", "leafB"]));
+    let big = b.wrap(chain(&["capA", "topA", "midA", "leafA"]));
+    let names: Vec<String> = big.iter().map(|fr| fr.error().to_string()).collect();
+    assert_eq!(names.len(), 7, "all 7 frames visited: {names:?}");
+    for name in ["capA", "topA", "midA", "leafA", "outerB", "midB", "leafB"] {
+        assert!(names.iter().any(|n| n == name), "missing {name}: {names:?}");
+    }
+    // Pre-order, children left-to-right: the wrapper's source chain comes
+    // before the wrapped fault's root.
+    assert_eq!(
+        &names[..5],
+        ["capA", "topA", "midA", "leafA", "outerB"],
+        "pre-order start: {names:?}"
+    );
+}
+
+#[test]
+fn root_cause_is_deepest_first_branch() {
+    let b = Fault::new(chain(&["outerB", "midB", "leafB"]));
+    let big = b.wrap(chain(&["capA", "topA", "midA", "leafA"]));
+    assert_eq!(big.root_cause().error().to_string(), "leafA");
+
+    let single = Fault::new(chain(&["only"]));
+    assert_eq!(single.root_cause().error().to_string(), "only");
+}

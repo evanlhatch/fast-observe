@@ -188,11 +188,12 @@ use std::cell::RefCell;
 use web_time::Instant;
 
 thread_local! {
-    pub(crate) static CURRENT_SCOPE: RefCell<Option<(Cow<'static, str>, Instant)>> = const { RefCell::new(None) };
+    pub(crate) static CURRENT_SCOPE: RefCell<Vec<(Cow<'static, str>, Instant)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Enter a function scope — sets the thread-local current scope name
-/// and logforth `scope` diagnostic. Returns a guard that clears both on drop.
+/// Enter a function scope — pushes `(name, now)` onto the thread-local scope
+/// stack and sets the logforth `scope` diagnostic to the leaf name.
+/// Returns a guard that pops the stack and restores both on drop.
 /// Takes `Cow<'static, str>` — static names are Borrowed, dynamic names are Owned (no leak).
 #[must_use]
 #[allow(
@@ -200,7 +201,7 @@ thread_local! {
     reason = "the name is stored in the thread-local — taking by value avoids a double clone at the call site"
 )]
 pub fn enter_function_scope(name: Cow<'static, str>) -> FunctionScopeGuard {
-    CURRENT_SCOPE.with(|s| *s.borrow_mut() = Some((name.clone(), Instant::now())));
+    CURRENT_SCOPE.with(|s| s.borrow_mut().push((name.clone(), Instant::now())));
     logforth::diagnostic::ThreadLocalDiagnostic::insert("scope", name.as_ref());
     FunctionScopeGuard
 }
@@ -221,21 +222,51 @@ pub fn enter_function_scope_with_tag(
     enter_function_scope(full)
 }
 
-/// Guard that clears the thread-local current scope and logforth `scope` diagnostic on drop.
+/// Guard that pops the thread-local scope stack and restores the logforth
+/// `scope` diagnostic on drop. Guards are created/dropped LIFO in well-formed
+/// code, so `pop()` removes exactly this guard's entry. An out-of-order drop
+/// (e.g. a `mem::forget`ed guard dropped later) pops whatever entry is on
+/// top — same LIFO discipline as the instant span stack; don't leak guards.
 pub struct FunctionScopeGuard;
 
 impl Drop for FunctionScopeGuard {
     fn drop(&mut self) {
-        CURRENT_SCOPE.with(|s| *s.borrow_mut() = None);
-        logforth::diagnostic::ThreadLocalDiagnostic::remove("scope");
+        let parent = CURRENT_SCOPE.with(|s| {
+            let mut stack = s.borrow_mut();
+            stack.pop();
+            stack.last().map(|(name, _)| name.clone())
+        });
+        match parent {
+            Some(name) => {
+                logforth::diagnostic::ThreadLocalDiagnostic::insert("scope", name.as_ref());
+            }
+            None => logforth::diagnostic::ThreadLocalDiagnostic::remove("scope"),
+        }
     }
 }
 
-/// Get the current function scope name (if any).
+/// Get the current (leaf) function scope name (if any).
 /// Returns a `Cow<'static, str>` — use `.as_ref()` or `.as_deref()` for `&str`.
 #[must_use]
 pub fn current_scope_name() -> Option<Cow<'static, str>> {
-    CURRENT_SCOPE.with(|s| s.borrow().as_ref().map(|(name, _)| name.clone()))
+    CURRENT_SCOPE.with(|s| s.borrow().last().map(|(name, _)| name.clone()))
+}
+
+/// The full scope path from outermost to innermost, e.g. `["request", "load_config", "parse_sql"]`.
+/// Empty when no scope is active.
+#[must_use]
+pub fn scope_path() -> Vec<Cow<'static, str>> {
+    CURRENT_SCOPE.with(|s| s.borrow().iter().map(|(name, _)| name.clone()).collect())
+}
+
+/// Milliseconds elapsed since the leaf scope was entered, if any scope is active.
+#[must_use]
+pub fn current_scope_elapsed_ms() -> Option<u128> {
+    CURRENT_SCOPE.with(|s| {
+        s.borrow()
+            .last()
+            .map(|(_, entered)| entered.elapsed().as_millis())
+    })
 }
 
 // ── Re-export the proc macros ─────────────────────────────────────────────
