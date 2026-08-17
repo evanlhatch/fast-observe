@@ -1,11 +1,23 @@
-//! Cheap monotonic clock for span timing.
+//! Cheap monotonic clock for span timing (DESIGN.md §2).
 //!
-//! Uses [`web_time::Instant`] — a drop-in `std::time::Instant` replacement
-//! that also works on wasm32 (browser `performance.now()`), so the instant
-//! backend compiles and runs everywhere.
+//! Split by target:
+//! - native: [`fastant::Instant`] — TSC reads (~2–5ns) on Linux `x86_64`,
+//!   automatic fallback to `std::time` where TSC is unstable.
+//! - wasm: [`web_time::Instant`] — browser `performance.now()`; fastant
+//!   would fall back to `std::time::Instant::now`, which panics on
+//!   wasm32-unknown-unknown.
 
 use std::sync::OnceLock;
-use web_time::Instant;
+
+#[cfg(not(target_family = "wasm"))]
+use fastant::Instant as InstantImpl;
+#[cfg(target_family = "wasm")]
+use web_time::Instant as InstantImpl;
+
+/// The target-selected monotonic instant type, exported for the profiling
+/// facade (scope stack timestamps) so it shares one clock source with
+/// [`now_ns`].
+pub type Instant = InstantImpl;
 
 /// Nanoseconds since an arbitrary process-monotonic origin.
 #[inline]
@@ -14,7 +26,7 @@ use web_time::Instant;
     reason = "value is clamped to u64::MAX immediately before the cast"
 )]
 pub fn now_ns() -> u64 {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    static ORIGIN: OnceLock<InstantImpl> = OnceLock::new();
     ORIGIN
         .get_or_init(Instant::now)
         .elapsed()

@@ -10,6 +10,18 @@ use std::fmt::Write as _;
 
 use crate::ErrorCategory;
 
+/// A stable error code provided through `Error::provide` (nightly
+/// `error_generic_member_access`) — readable from any `&dyn Error` via
+/// `core::error::request_value::<ErrorCode>(_)`. `error!`-generated types
+/// provide this automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ErrorCode(pub &'static str);
+
+/// An error's category provided through `Error::provide` — same channel as
+/// [`ErrorCode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CategoryTag(pub ErrorCategory);
+
 /// An error with a stable registry code — implemented by `define_errors!`
 /// (and later `error!`) output. Drives code-in-tree rendering, doctor, and
 /// policy-derived advice.

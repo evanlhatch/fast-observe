@@ -8,8 +8,10 @@
 //!
 //! An optional global throttle (see
 //! [`ObserveConfig::set_error_hook_throttle`]) caps hook invocations to N per
-//! error type per second. [`init`] additionally wires logforth (only the
-//! appenders/diagnostics enabled by cargo features) and fastrace.
+//! error type per second. [`init`] is the idempotent zero-config path; it
+//! delegates to the deployment builder in [`deploy`](crate::deploy), which
+//! owns the logforth/fastrace composition. `observe().init()?` is the
+//! checked path (reports `AlreadyInitialized` instead of ignoring it).
 //!
 //! A second hook family — [`add_capture_hook`] — runs DURING frame
 //! construction (before the frame is `Arc`'d) and may mutate the frame
@@ -260,70 +262,24 @@ pub(crate) fn invoke(frame: &Frame) {
     }
 }
 
-/// Initialize the observability stack:
+/// Initialize the observability stack — the idempotent zero-config path.
 ///
-/// 1. **Logforth** — `ThreadLocalDiagnostic` always; composes only the
-///    appenders/diagnostics enabled by cargo features:
-///    - `fastrace` → `FastraceDiagnostic` + `FastraceEvent` appender.
-///    - `json` → JSON layout on the stdout appender.
-///    - `file` → rolling file appender when `OBSERVE_LOG_DIR` is set.
-///    - `web` (wasm32 only) → browser-console appender.
-/// 2. **Fastrace** — `ConsoleReporter` (feature `fastrace`).
+/// Delegates to the deployment builder ([`observe()`](crate::deploy::observe)),
+/// which owns the composition (logforth appenders/diagnostics per cargo
+/// feature + the fastrace console reporter). Equivalent to
+/// `observe().init()` with an ignored result: [`InitError::AlreadyInitialized`]
+/// (a second `init()`, or a logger installed by someone else) is IGNORED.
+/// Call once at startup; harmless if called again. The error hooks need no
+/// setup — the default hook self-installs on first use.
 ///
-/// The error hooks need no setup — the default hook self-installs on first
-/// use. Call once at startup; harmless if called again (a second
-/// `try_apply` failure is ignored).
+/// For the checked path (and configurable toggles), use
+/// `observe()….init()?` instead.
+///
+/// [`InitError::AlreadyInitialized`]: crate::deploy::InitError::AlreadyInitialized
 pub fn init() {
-    let result = logforth::starter_log::builder()
-        .dispatch(|d| {
-            let d = d.diagnostic(logforth::diagnostic::ThreadLocalDiagnostic::default());
-            #[cfg(feature = "fastrace")]
-            let d = d.diagnostic(logforth_diagnostic_fastrace::FastraceDiagnostic::default());
-
-            #[cfg(feature = "json")]
-            let stdout = logforth::append::Stdout::default()
-                .with_layout(logforth_layout_json::JsonLayout::default());
-            #[cfg(not(feature = "json"))]
-            let stdout = logforth::append::Stdout::default();
-
-            let d = d.append(stdout);
-            #[cfg(feature = "fastrace")]
-            let d = d.append(logforth_append_fastrace::FastraceEvent::default());
-            #[cfg(all(feature = "web", target_arch = "wasm32"))]
-            let d = d.append(crate::profiling::web::WebConsoleAppend);
-            #[cfg(feature = "file")]
-            let d = match file_appender() {
-                Some(f) => d.append(f),
-                None => d,
-            };
-            d
-        })
-        .try_apply();
-
-    if result.is_ok() {
-        // Clamp to Info so hot-path trace/debug macros compile out to no-ops.
-        log::set_max_level(log::LevelFilter::Info);
-    }
-
-    #[cfg(feature = "fastrace")]
-    fastrace::set_reporter(
-        fastrace::collector::ConsoleReporter,
-        fastrace::collector::Config::default(),
-    );
-}
-
-/// Rolling file appender, enabled by setting `OBSERVE_LOG_DIR` to a writable
-/// directory. Logs roll into `<dir>/app.log`.
-#[cfg(feature = "file")]
-fn file_appender() -> Option<logforth_append_file::File> {
-    let dir = std::env::var("OBSERVE_LOG_DIR").ok()?;
-    match logforth_append_file::FileBuilder::new(dir, "app.log").build() {
-        Ok(f) => Some(f),
-        Err(e) => {
-            log::error!(target: "fast_observe.hook", "failed to build file appender: {e}");
-            None
-        }
-    }
+    // Dropping an Ok guard flushes fastrace immediately — harmless at init
+    // (no spans collected yet) and keeps this path allocation-free.
+    drop(crate::deploy::observe().init());
 }
 
 /// Install an `OpenTelemetry` reporter for fastrace (feature `otel`).

@@ -384,6 +384,12 @@ impl<E: Error + Send + Sync + 'static> Error for SharedError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.0.source()
     }
+
+    // Forward provide() so codes/categories/attachments the inner error
+    // offers stay visible through the delegating wrapper.
+    fn provide<'a>(&'a self, request: &mut core::error::Request<'a>) {
+        self.0.provide(request);
+    }
 }
 
 /// Same as [`SharedError`] but for `BoxError`, which does not itself
@@ -401,6 +407,10 @@ impl fmt::Display for SharedBoxedError {
 impl Error for SharedBoxedError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.0.source()
+    }
+
+    fn provide<'a>(&'a self, request: &mut core::error::Request<'a>) {
+        self.0.provide(request);
     }
 }
 

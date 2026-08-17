@@ -24,6 +24,8 @@ use proc_macro2::{Delimiter, Group, Ident, Literal, Span, TokenStream as TokenSt
 use quote::{ToTokens, quote};
 use venial::{Attribute, Function, ImplMember, Item};
 
+mod error_macro;
+
 /// Rejection text for async fns (shared by `#[instrument]` / `#[all_functions]`).
 /// Our scope guards are thread-bound: holding one across `.await` would make
 /// futures `!Send` and misattribute time under task interleaving.
@@ -218,6 +220,73 @@ pub fn all_functions(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     finish(imp.into_token_stream(), errors)
+}
+
+/// Define a typed error enum with thiserror-compatible attributes plus
+/// fast-observe codes, categories, advice, and registry registration.
+///
+/// ```ignore
+/// fast_observe::error! {
+///     /// Doc comments pass through to the enum.
+///     pub enum EngineError {
+///         /// Variant docs pass through to the generated struct; the first
+///         /// doc line is the default `advice`.
+///         #[error("entity not found: {id}")]
+///         #[code = "E001", category = Content, advice = "check the entity table"]
+///         EntityNotFound { id: u64 },
+///
+///         #[error("io: {0}")]
+///         #[from]
+///         Io(std::io::Error),
+///
+///         #[error("pipeline layout: {source}")]
+///         #[code = "E428", category = Transient]
+///         PipelineLayout { #[source] source: Box<EngineError> },
+///     }
+/// }
+/// ```
+///
+/// Attributes (thiserror's subset works verbatim):
+/// - `#[error("...")]` — Display template, REQUIRED on every variant.
+///   Forwarded to `write!` unparsed: struct variants interpolate
+///   `{field}`/`{field:?}`; tuple variants interpolate `{0}`..`{N}`.
+/// - `#[code = "E123", category = <Category>, advice = "..."]` — opts the
+///   variant into the `ERROR_REGISTRY` / doctor / report codes. `category`
+///   is REQUIRED with `code` (and vice versa); `advice` may also be a
+///   standalone `#[advice = "..."]`; its default is the first doc line.
+/// - `#[from]` — single-field tuple variants only: generates
+///   `From<InnerType>` for the enum and wires `source()` to the inner
+///   error. (`From<InnerType> for Fault<Enum>` is NOT generated — with a
+///   foreign inner type it would violate the orphan rule, since `Fault` is
+///   not `#[fundamental]`; use `Err(inner).map_err(Enum::from)?`.)
+/// - `#[source]` — marks a struct-variant field as the `Error::source()`;
+///   a field NAMED `source` is wired without the attribute.
+/// - `#[max_size = N]` on the enum — overrides the 64-byte size budget
+///   enforced by a generated `const _` assertion.
+///
+/// Generated: the enum (docs + unknown attributes like `#[cfg]` forwarded;
+/// `#[cfg]`/`#[cfg_attr]` also propagate onto the generated impls and match
+/// arms), one public struct per struct variant, per-variant + enum
+/// `Display`/`Error` impls (including nightly `Error::provide` of
+/// `ErrorCode`/`CategoryTag` for coded variants), `From<Variant> for Enum`
+/// and `From<Variant> for Fault<Enum>`, a per-variant `ENTRY` const plus
+/// link-time registration (non-wasm; needs `linkme` in the consuming
+/// crate's dependencies, same as `define_errors!`), and `Enum::ENTRIES`
+/// (coded variants only) for the wasm composition path.
+///
+/// `code()` / `category()` / `advice()` and the
+/// `::fast_observe::errors::Coded` impl are generated ONLY when EVERY
+/// variant is coded — a mixed enum has no total `code()`, so the methods
+/// (and the trait) are omitted rather than returning placeholders.
+///
+/// v1 limits: no generics/where clauses; `#[from]` requires a single-field
+/// tuple variant; uncoded variants behave exactly like thiserror output.
+///
+/// The input enum must implement `Debug` (e.g. via `#[derive(Debug)]`), as
+/// the generated `Error` impls require it.
+#[proc_macro]
+pub fn error(item: TokenStream) -> TokenStream {
+    error_macro::expand(TokenStream2::from(item)).into()
 }
 
 /// Identity attribute: strips itself, leaves the item unchanged.

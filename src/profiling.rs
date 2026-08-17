@@ -286,8 +286,8 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
-// web_time, not std: `std::time::Instant::now` panics on wasm32-unknown-unknown.
-use web_time::Instant;
+// Target-selected clock (fastant native / web-time wasm) — see `clock.rs`.
+use self::clock::Instant;
 
 thread_local! {
     pub(crate) static CURRENT_SCOPE: RefCell<Vec<(Cow<'static, str>, Instant)>> = const { RefCell::new(Vec::new()) };

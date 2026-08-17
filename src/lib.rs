@@ -1,7 +1,13 @@
+// Nightly is required (see README). Gates, with tracking issues:
+// - error_generic_member_access: Error::provide/request_ref — codes,
+//   categories and attachments readable through &dyn Error
+//   (https://github.com/rust-lang/rust/issues/99301)
+#![feature(error_generic_member_access)]
 #![doc = include_str!("../README.md")]
 
 #[cfg(feature = "instant")]
 pub mod breakdown;
+pub mod compat;
 pub mod config;
 pub mod deploy;
 pub mod diagnostic;
@@ -9,6 +15,7 @@ pub mod errors;
 pub mod exn;
 pub mod hook;
 pub mod profiling;
+pub mod report;
 
 #[cfg(feature = "fastrace")]
 pub mod reporter;
@@ -20,7 +27,10 @@ pub use diagnostic::{
     Diagnostic, LabelSpan, Severity, SourceSpan, eprint_diagnostic, register_source,
     render_diagnostic,
 };
-pub use errors::{Coded, ERROR_REGISTRY, ErrorRegistryEntry, doctor, error_registry, lookup_error};
+pub use errors::{
+    CategoryTag, Coded, ERROR_REGISTRY, ErrorCode, ErrorRegistryEntry, doctor, error_registry,
+    lookup_error,
+};
 pub use exn::{
     Attachment, BoxError, Context, ErrorExt, Fault, FaultCollection, Frame, FrameIter,
     InternalError, OptionExt, Placement, Result, ResultExt, SimpleError, error_counts,
@@ -31,8 +41,18 @@ pub use hook::{
 #[cfg(feature = "instant")]
 pub use profiling::instant::SpanRecord;
 pub use profiling::{
-    all_functions, current_scope_elapsed_ms, current_scope_name, scope_path, skip,
+    all_functions, current_scope_elapsed_ms, current_scope_name, instrument, scope_path, skip,
 };
+#[cfg(feature = "serde")]
+pub use report::render_report_json;
+pub use report::{render_report, report_display};
+
+/// Declarative error definitions — thiserror-compatible attributes plus
+/// `#[code]`/`#[category]`/`#[advice]` registry integration.
+pub use fast_observe_macros::error;
+
+#[cfg(feature = "anyhow-boundary")]
+pub use compat::anyhow_boundary;
 
 /// The error category — drives retry/poison/abort policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, derive_more::Display)]
@@ -89,6 +109,14 @@ impl Policy {
 }
 
 pub use ErrorCategory as Category;
+
+// ── Macro support internals (not public API) ──────────────────────────────
+
+#[doc(hidden)]
+#[cfg(not(target_family = "wasm"))]
+pub mod __private {
+    pub use linkme::distributed_slice;
+}
 
 // ── Feature re-exports (plugin crates, opt-in) ────────────────────────────
 

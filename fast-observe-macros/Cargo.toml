@@ -19,6 +19,9 @@ venial = "0.6"
 # don't create publish cycles.
 [dev-dependencies]
 fast-observe = { path = "..", features = ["instant"] }
+# linkme's distributed_slice expansion references `::linkme` paths, so
+# `error!`-generated registrations need it in scope (same as define_errors!).
+linkme = "0.3"
 
 [lints.rust]
 unsafe_code = "deny"

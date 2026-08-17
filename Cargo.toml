@@ -51,6 +51,8 @@ profile-with-tracing = ["dep:tracing"]
 profile-with-superluminal = ["dep:superluminal-perf"]
 # serde Serialize/Deserialize for Diagnostic, Severity, SourceSpan.
 serde = ["dep:serde", "camino/serde1"]
+# Explicit anyhow ↔ Fault boundary conversions (never implicit From).
+anyhow-boundary = ["dep:anyhow"]
 
 [dependencies]
 parking_lot = "0.12"
@@ -65,7 +67,7 @@ fs-err = "3.3"
 bon = "3"
 fast-observe-macros = { path = "fast-observe-macros" }
 ariadne = "0.6"
-web-time = "1.1"
+anyhow = { version = "1", optional = true, default-features = false }
 humantime = { version = "2.2", optional = true }
 nu-ansi-term = { version = "0.50", optional = true }
 fastrace = { version = "0.7", optional = true }
@@ -92,8 +94,13 @@ linkme = "0.3"
 wasm-bindgen = { version = "0.2", optional = true }
 web-sys = { version = "0.3", features = ["console"], optional = true }
 
+# Clock split (DESIGN.md §2): web-time on wasm, fastant (TSC) on native.
+[target.'cfg(target_family = "wasm")'.dependencies]
+web-time = "1.1"
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 linkme = "0.3"
+fastant = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 superluminal-perf = { version = "0.4", optional = true }

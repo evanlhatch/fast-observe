@@ -288,12 +288,14 @@ checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 name = "fast-observe"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ariadne",
  "bon",
  "camino",
  "derive_more",
  "documented",
  "fast-observe-macros",
+ "fastant",
  "fastrace",
  "fastrace-opentelemetry",
  "fastrace-reqwest",
@@ -329,6 +331,7 @@ name = "fast-observe-macros"
 version = "0.1.0"
 dependencies = [
  "fast-observe",
+ "linkme",
  "proc-macro2",
  "quote",
  "venial",
