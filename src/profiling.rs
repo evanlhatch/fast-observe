@@ -373,9 +373,7 @@ pub fn current_scope_elapsed_ms() -> Option<u128> {
 
 // ── Re-export the proc macros ─────────────────────────────────────────────
 
-pub use profiling_procmacros::all_functions;
-pub use profiling_procmacros::function;
-pub use profiling_procmacros::skip;
+pub use fast_observe_macros::{all_functions, instrument, skip};
 
 #[cfg(test)]
 mod tests {

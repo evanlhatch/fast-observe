@@ -6,15 +6,40 @@
 //! app's doctor/CLI (e.g. `myapp doctor <code>`) looks up errors
 //! workspace-wide. This crate stays a clean leaf: no app-specific types.
 
+use std::fmt::Write as _;
+
 use crate::ErrorCategory;
+
+/// An error with a stable registry code — implemented by `define_errors!`
+/// (and later `error!`) output. Drives code-in-tree rendering, doctor, and
+/// policy-derived advice.
+pub trait Coded {
+    /// Stable registry code, e.g. `"E100"`.
+    fn code(&self) -> &'static str;
+    /// Error category — drives [`crate::ErrorCategory::policy`].
+    fn category(&self) -> ErrorCategory;
+    /// Prescriptive advice for the report/doctor output.
+    fn advice(&self) -> Option<&'static str> {
+        None
+    }
+}
 
 /// One entry in the error registry — maps a code string to metadata.
 #[derive(Debug, Clone)]
 pub struct ErrorRegistryEntry {
+    /// Stable code, e.g. `"E100"` — the doctor/CLI lookup key.
     pub code: &'static str,
+    /// Variant struct name, e.g. `"CompileError"`.
     pub name: &'static str,
+    /// Error category — drives [`ErrorCategory::policy`](crate::ErrorCategory::policy).
     pub category: ErrorCategory,
+    /// Canonical one-line display string.
     pub display: &'static str,
+    /// Prescriptive advice — `None` for legacy `define_errors!` entries;
+    /// populated by the future `error!` macro.
+    pub advice: Option<&'static str>,
+    /// Defining module path (`module_path!()` at the `define_errors!` call site).
+    pub module: &'static str,
 }
 
 /// Global error registry. One distributed slice spanning every linked
@@ -49,6 +74,29 @@ pub fn error_registry() -> impl Iterator<Item = &'static ErrorRegistryEntry> {
 #[must_use]
 pub fn lookup_error(code: &str) -> Option<&'static ErrorRegistryEntry> {
     ERROR_REGISTRY.iter().find(|e| e.code == code)
+}
+
+/// Render a doctor report for an error code: code, name, category, policy
+/// advice line, canonical display, advice, defining module. Deterministic
+/// `key: value` lines, one fact per line.
+#[must_use]
+pub fn doctor(code: &str) -> Option<String> {
+    let entry = lookup_error(code)?;
+    let mut out = format!(
+        "code: {}\nname: {}\ncategory: {}\npolicy: {}\ndisplay: {}",
+        entry.code,
+        entry.name,
+        entry.category,
+        entry.category.policy().advice_line(),
+        entry.display,
+    );
+    if let Some(advice) = entry.advice {
+        // Infallible on String.
+        let _ = write!(out, "\nadvice: {advice}");
+    }
+    // Infallible on String.
+    let _ = write!(out, "\nmodule: {}", entry.module);
+    Some(out)
 }
 
 /// Generates error variant structs + per-struct Display/Error + ENTRY
@@ -127,6 +175,8 @@ macro_rules! define_errors {
                     name: stringify!($name),
                     category: $crate::ErrorCategory::$cat,
                     display: $display,
+                    advice: None,
+                    module: module_path!(),
                 };
             }
 

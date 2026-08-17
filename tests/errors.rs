@@ -3,7 +3,8 @@
 //! file registers — cross-crate visibility is proven by the consuming
 //! workspace's own registry tests.
 
-use fast_observe::{ErrorCategory, define_errors, error_registry, lookup_error};
+use fast_observe::errors::doctor;
+use fast_observe::{ErrorCategory, Policy, define_errors, error_registry, lookup_error};
 
 /// Test error enum — exercises the macro outside any app crate.
 #[derive(Debug)]
@@ -53,4 +54,55 @@ fn registry_iterates_all_local_entries() {
     let codes: std::collections::HashSet<&'static str> = error_registry().map(|e| e.code).collect();
     assert!(codes.contains("E991"));
     assert!(codes.contains("E992"));
+}
+
+#[test]
+fn entry_has_module_path() {
+    let entry = lookup_error("E991").expect("E991 registered");
+    assert!(
+        entry.module.ends_with("errors"),
+        "module was {}",
+        entry.module
+    );
+    // Legacy macro entries carry no advice.
+    assert_eq!(entry.advice, None);
+}
+
+#[test]
+fn doctor_renders_known_code() {
+    let report = doctor("E991").expect("E991 registered");
+    assert!(report.contains("code: E991"), "report:\n{report}");
+    assert!(report.contains("name: Boom"), "report:\n{report}");
+    assert!(report.contains("category: Invariant"), "report:\n{report}");
+    assert!(report.contains("policy: "), "report:\n{report}");
+    assert!(report.contains("display: boom"), "report:\n{report}");
+    assert!(report.contains("module: "), "report:\n{report}");
+    // No advice on legacy entries — no advice line rendered.
+    assert!(!report.contains("advice: "), "report:\n{report}");
+    assert!(doctor("E999").is_none());
+}
+
+#[test]
+fn policy_mapping() {
+    assert_eq!(ErrorCategory::Content.policy(), Policy::FixInput);
+    assert_eq!(ErrorCategory::Transient.policy(), Policy::Retry);
+    assert_eq!(ErrorCategory::Invariant.policy(), Policy::Poison);
+    assert_eq!(ErrorCategory::Fatal.policy(), Policy::Abort);
+
+    assert_eq!(
+        Policy::FixInput.advice_line(),
+        "fix the input; retrying unchanged input will fail"
+    );
+    assert_eq!(
+        Policy::Retry.advice_line(),
+        "safe to retry with backoff; if persistent, escalate"
+    );
+    assert_eq!(
+        Policy::Poison.advice_line(),
+        "state may be corrupt; unwind to a recovery boundary and reinitialize"
+    );
+    assert_eq!(
+        Policy::Abort.advice_line(),
+        "fatal invariant violation; do not continue this process"
+    );
 }

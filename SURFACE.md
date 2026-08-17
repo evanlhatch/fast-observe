@@ -337,7 +337,7 @@ condenses to exactly:
 3. **`bail!` / `ensure!`** — error values. bail! IS the log statement:
    construct + count + span event + log in one verb. Double-reporting
    (`log::error!` then `return Err`) is an anti-pattern the vendored
-   AGENTS.md snippet calls out by name.
+   vendored OBSERVE.md snippet calls out by name.
 4. **`#[instrument]` / `#[all_functions]`** — zero-effort propagation
    (shift-left: one attribute instruments a whole impl block).
 5. **`error!`** — typed error definitions (codes/categories enforced at
@@ -439,10 +439,10 @@ Agents that never WRITE fast-observe code still READ its output. The report
 is self-teaching: the `action:` line names concrete next steps
 ("run `flatlandc doctor E100`"), and swallowed-error paths name the API
 ("intentional swallow: use `.report(msg)` so this is counted").
-Additionally the crate ships an `AGENTS.md`/`SKILL.md` snippet projects can
-vendor — a one-page translation table (the one above) so in-repo agents
-adopt the vocabulary on sight. This is the cheapest adoption lever that
-exists.
+Additionally the crate ships `OBSERVE.md` — a short agent guide projects
+can vendor — with a one-page translation table (the one above) so in-repo
+agents adopt the vocabulary on sight. This is the cheapest adoption lever
+that exists.
 
 ## 7. The Report (output contract for humans AND LLM agents)
 

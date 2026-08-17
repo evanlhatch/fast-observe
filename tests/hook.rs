@@ -1,9 +1,13 @@
 //! New-behavior tests: multi-sink fan-out, hook panic containment, and the
 //! per-type per-second hook throttle.
 
-use fast_observe::exn::Fault;
-use fast_observe::hook::{clear_error_hooks, hooks_len, set_default_hook_enabled};
+use fast_observe::exn::{Attachment, Fault};
+use fast_observe::hook::{
+    add_capture_hook, clear_error_hooks, hooks_len, set_default_hook_enabled,
+};
+use fast_observe::profiling::enter_function_scope;
 use fast_observe::{add_error_hook, config};
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::sync::Mutex;
@@ -208,5 +212,99 @@ fn default_hook_can_be_disabled_and_reenabled() {
     assert_eq!(
         fired, 1,
         "custom hook must still fire while default hook disabled, got {fired}"
+    );
+}
+
+// ── Capture hooks — run during frame construction, may attach data ────────
+
+unique_error!(CaptureMarkerError, "capture marker");
+
+// Unique newtype for find_attachment — a bare `String` value would be
+// ambiguous against the built-in hooks' `String` attachments.
+struct Marker;
+impl fmt::Display for Marker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("yes")
+    }
+}
+
+#[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
+fn capture_hooks_attach_data() {
+    let _serial = TEST_LOCK.lock().unwrap();
+
+    add_capture_hook(|frame| {
+        if frame.type_name().ends_with("CaptureMarkerError") {
+            frame.push_attachment(Attachment::with_key("marker", Marker));
+        }
+    });
+
+    let f = Fault::new(CaptureMarkerError);
+    let marker = f.frame().find_attachment::<Marker>();
+    assert!(
+        marker.is_some(),
+        "capture hook attachment must be present on the root frame"
+    );
+    assert_eq!(
+        marker.map(ToString::to_string).as_deref(),
+        Some("yes"),
+        "attached Marker must display as yes"
+    );
+}
+
+unique_error!(CapturePanicError, "capture panic");
+
+#[test]
+#[allow(
+    clippy::panic,
+    clippy::manual_assert,
+    clippy::items_after_statements,
+    clippy::unwrap_used,
+    reason = "the test deliberately installs a panicking capture hook to verify containment; unwrap is test idiom"
+)]
+fn capture_hook_panic_is_contained() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    static AFTER: AtomicUsize = AtomicUsize::new(0);
+
+    add_capture_hook(|frame| {
+        if frame.type_name().ends_with("CapturePanicError") {
+            panic!("deliberate capture hook panic");
+        }
+    });
+    add_capture_hook(|frame| {
+        if frame.type_name().ends_with("CapturePanicError") {
+            AFTER.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let before = AFTER.load(Ordering::Relaxed);
+    // Construction must succeed despite the panicking capture hook.
+    let f = Fault::new(CapturePanicError);
+    assert!(f.to_string().contains("capture panic"));
+    assert_eq!(
+        AFTER.load(Ordering::Relaxed) - before,
+        1,
+        "capture hook registered after the panicking one must still run"
+    );
+}
+
+unique_error!(ScopedCaptureError, "scoped capture");
+
+#[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
+fn scope_path_attached_when_scoped() {
+    let _serial = TEST_LOCK.lock().unwrap();
+
+    let _scope = enter_function_scope(Cow::Borrowed("test_scope"));
+    let f = Fault::new(ScopedCaptureError);
+
+    let has_scope_path = f
+        .frame()
+        .attachments()
+        .iter()
+        .any(|a| a.key() == Some("scope_path"));
+    assert!(
+        has_scope_path,
+        "built-in scope hook must attach scope_path when a scope is active"
     );
 }

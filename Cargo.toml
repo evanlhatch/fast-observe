@@ -1,3 +1,6 @@
+[workspace]
+members = ["fast-observe-macros"]
+
 [package]
 name = "fast-observe"
 version = "0.1.0"
@@ -59,7 +62,8 @@ derive_more = { version = "1.0", features = ["display"] }
 sealed = "0.6"
 camino = "1.2"
 fs-err = "3.3"
-profiling-procmacros = "1.0"
+bon = "3"
+fast-observe-macros = { path = "fast-observe-macros" }
 ariadne = "0.6"
 web-time = "1.1"
 humantime = { version = "2.2", optional = true }

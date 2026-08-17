@@ -124,6 +124,38 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    /// An attachment with just a value — rendered as its display string,
+    /// [`Placement::Inline`]. Used by capture hooks; see also the
+    /// consuming [`Fault::attach`] API.
+    ///
+    /// The display string is computed once, here; the typed value stays
+    /// reachable via [`Attachment::downcast`].
+    #[must_use]
+    pub fn new(value: impl fmt::Display + Send + Sync + 'static) -> Self {
+        Self {
+            key: None,
+            display: value.to_string(),
+            value: Arc::new(value),
+            placement: Placement::Inline,
+        }
+    }
+    /// An attachment with a key — rendered `key: value`,
+    /// [`Placement::Inline`].
+    #[must_use]
+    pub fn with_key(key: &'static str, value: impl fmt::Display + Send + Sync + 'static) -> Self {
+        Self {
+            key: Some(key),
+            display: value.to_string(),
+            value: Arc::new(value),
+            placement: Placement::Inline,
+        }
+    }
+    /// Builder-style [`Placement`] override.
+    #[must_use]
+    pub fn with_placement(mut self, placement: Placement) -> Self {
+        self.placement = placement;
+        self
+    }
     /// The attachment's key, when it was attached with one.
     #[must_use]
     pub fn key(&self) -> Option<&'static str> {
@@ -196,14 +228,18 @@ impl Frame {
     ) -> Arc<Frame> {
         let context = crate::profiling::current_scope_name().map_or(Context::None, Context::Scope);
         let children = walk_sources(&*error, location);
-        let frame = Arc::new(Frame {
+        let mut frame = Frame {
             error,
             location,
             context,
             children,
             type_name,
             attachments: Vec::new(),
-        });
+        };
+        // Capture hooks run on `&mut Frame` BEFORE sharing — they may push
+        // attachments. Order: capture (mutate) → share → sink-notify.
+        crate::hook::run_capture_hooks(&mut frame);
+        let frame = Arc::new(frame);
         crate::hook::invoke(&frame);
         frame
     }
@@ -244,6 +280,13 @@ impl Frame {
         self.attachments.iter().find_map(Attachment::downcast::<T>)
     }
 
+    /// Push an attachment onto this frame. Used by capture hooks
+    /// ([`crate::hook::run_capture_hooks`]), which receive `&mut Frame`
+    /// BEFORE the frame is wrapped in `Arc` — on a shared frame this is
+    /// unreachable because construction completes before sharing.
+    pub fn push_attachment(&mut self, attachment: Attachment) {
+        self.attachments.push(attachment);
+    }
     /// Pre-order iterator over this frame and all descendants (self first,
     /// then children recursively). Explicit-stack implementation, no allocation
     /// beyond the stack Vec.
@@ -302,6 +345,16 @@ impl fmt::Display for Frame {
             write!(f, " ({})", self.context)?;
         }
         Ok(())
+    }
+}
+
+/// Makes the causal tree traversable via the standard `Error::source`
+/// protocol (anyhow walkers, `error.sources()`, …): the source is the FIRST
+/// child frame — the direct cause — so walking `source()` descends the
+/// first-branch chain, mirroring the tree's causality.
+impl Error for Frame {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.children.first().map(|c| c.as_ref() as &dyn Error)
     }
 }
 
@@ -467,11 +520,9 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
         value: A,
         placement: Placement,
     ) -> Self {
-        let attachment = Attachment {
-            key,
-            display: value.to_string(),
-            value: Arc::new(value),
-            placement,
+        let attachment = match key {
+            Some(key) => Attachment::with_key(key, value).with_placement(placement),
+            None => Attachment::new(value).with_placement(placement),
         };
         if let Some(frame) = Arc::get_mut(&mut self.root) {
             frame.attachments.push(attachment);
@@ -494,23 +545,6 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     #[must_use]
     pub fn context(&self) -> &Context {
         &self.root.context
-    }
-
-    /// The root frame (shared via Arc).
-    #[must_use]
-    pub fn frame(&self) -> &Frame {
-        &self.root
-    }
-
-    /// Consume the fault and return the shared root frame.
-    #[must_use]
-    pub fn into_frame(self) -> Arc<Frame> {
-        self.root
-    }
-
-    /// Pre-order iterator over every frame in the causal tree, starting at the root.
-    pub fn iter(&self) -> FrameIter {
-        self.root.iter()
     }
 
     /// The deepest frame in the tree — the root cause. For a chain
@@ -541,6 +575,30 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     }
 }
 
+/// Frame accessors that need no `E: Error` bound — kept outside the
+/// `E: Error` impl block so `Fault<SimpleError>` (`Box<dyn Error>` does not
+/// itself implement `Error`) and [`FaultCollection`] can use them.
+impl<E: Send + Sync + Sized + 'static> Fault<E> {
+    /// The root frame (shared via Arc).
+    #[must_use]
+    pub fn frame(&self) -> &Frame {
+        &self.root
+    }
+
+    /// Pre-order iterator over every frame in the causal tree, starting at the root.
+    pub fn iter(&self) -> FrameIter {
+        self.root.iter()
+    }
+
+    /// Consume the fault and return the shared root frame.
+    ///
+    /// [`FaultCollection`] collects faults of any `E` — only the frames are kept.
+    #[must_use]
+    pub fn into_frame(self) -> Arc<Frame> {
+        self.root
+    }
+}
+
 impl<E: Send + Sync + Sized + 'static> Deref for Fault<E> {
     type Target = E;
     fn deref(&self) -> &E {
@@ -549,7 +607,16 @@ impl<E: Send + Sync + Sized + 'static> Deref for Fault<E> {
     }
 }
 
-impl<E: Error + Send + Sync + Sized + 'static> Error for Fault<E> {}
+impl<E: Error + Send + Sync + Sized + 'static> Error for Fault<E> {
+    /// Chains into the causal TREE, not into `E`'s own source: the root
+    /// frame's children already encode `E`'s source chain (captured at
+    /// construction) plus raised/wrapped contexts, and [`Fault::deref`]
+    /// covers the typed-`E` view. `Error::source` walkers therefore see the
+    /// same structure that `Debug` renders.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.root.source()
+    }
+}
 
 impl<E: Send + Sync + Sized + 'static> fmt::Display for Fault<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -565,6 +632,94 @@ impl<E: Send + Sync + Sized + 'static> fmt::Display for Fault<E> {
 
 /// `Result<T, Fault<E>>` — the standard return type.
 pub type Result<T, E = SimpleError> = core::result::Result<T, Fault<E>>;
+
+// ── FaultCollection — multi-failure aggregation ────────────────────────────
+
+/// Collects multiple faults (retry attempts, batch failures) into one tree.
+/// Stores the collected faults' root frames — cheap `Arc` moves, no re-capture
+/// and no extra hook firings.
+#[derive(Default)]
+pub struct FaultCollection {
+    frames: Vec<Arc<Frame>>,
+}
+
+impl FaultCollection {
+    /// An empty collection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Collect one fault's root frame.
+    pub fn push<E: Send + Sync + Sized + 'static>(&mut self, fault: Fault<E>) {
+        self.frames.push(fault.into_frame());
+    }
+
+    /// Number of collected faults.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// True when no faults were collected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Wrap all collected failures under a new error: one [`Fault`] whose
+    /// root has every collected fault's root as a child (after `err`'s own
+    /// captured source chain, if any).
+    ///
+    /// The fresh root is uniquely owned, so the merge always applies.
+    #[track_caller]
+    pub fn into_fault<T: Error + Send + Sync + Sized + 'static>(self, err: T) -> Fault<T> {
+        let mut fault = Fault::new(err);
+        if let Some(root) = Arc::get_mut(&mut fault.root) {
+            root.children.extend(self.frames);
+        }
+        fault
+    }
+
+    /// Same as [`FaultCollection::into_fault`] but the root is a plain
+    /// message (`Fault<SimpleError>`).
+    #[track_caller]
+    pub fn into_fault_msg(self, msg: impl Into<Cow<'static, str>>) -> Fault {
+        let mut fault = Fault::from_boxed(internal_err(msg));
+        if let Some(root) = Arc::get_mut(&mut fault.root) {
+            root.children.extend(self.frames);
+        }
+        fault
+    }
+}
+
+/// Collect `Err` values straight into a [`FaultCollection`] — any `E`, only
+/// the frames are kept:
+///
+/// ```
+/// # use core::fmt;
+/// # use fast_observe::exn::{Fault, FaultCollection};
+/// # #[derive(Debug)] struct BatchErr;
+/// # impl fmt::Display for BatchErr {
+/// #     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("batch") }
+/// # }
+/// # impl std::error::Error for BatchErr {}
+/// let results: Vec<Result<i32, Fault<BatchErr>>> = vec![Ok(1), Err(Fault::new(BatchErr))];
+/// let failures = results
+///     .into_iter()
+///     .filter_map(Result::err)
+///     .collect::<FaultCollection>();
+/// assert_eq!(failures.len(), 1);
+/// ```
+impl<E: Send + Sync + Sized + 'static> FromIterator<Fault<E>> for FaultCollection {
+    fn from_iter<I: IntoIterator<Item = Fault<E>>>(iter: I) -> Self {
+        let mut collection = Self::new();
+        collection
+            .frames
+            .extend(iter.into_iter().map(Fault::into_frame));
+        collection
+    }
+}
 
 // ── ErrorExt — fluent raise on error types ─────────────────────────────────
 

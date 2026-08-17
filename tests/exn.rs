@@ -5,7 +5,7 @@
 use core::fmt;
 use std::error::Error;
 
-use fast_observe::exn::{Context, Fault, OptionExt, Placement, Result, ResultExt};
+use fast_observe::exn::{Context, Fault, FaultCollection, OptionExt, Placement, Result, ResultExt};
 use fast_observe::{ErrorCategory, bail};
 
 // ── Context Display stability — these strings appear in logs and crash
@@ -327,4 +327,68 @@ fn non_last_frame_attachments_use_continuation() {
         dbg.contains("    `-- midB"),
         "real child after attachment is last: {dbg}"
     );
+}
+
+// ── Error::source chaining into the tree ──────────────────────────────
+
+#[test]
+fn fault_source_chains_into_tree() {
+    let fault = Fault::new(chain(&["a", "b", "c"]));
+    // Walking `Error::source` from the Fault descends the tree: root's first
+    // child is "b", its first child is "c", then the chain ends.
+    let b = Error::source(&fault).expect("root has a source");
+    assert_eq!(b.to_string(), "b");
+    let c = b.source().expect("b frame has a source");
+    assert_eq!(c.to_string(), "c");
+    assert!(c.source().is_none(), "c frame is the leaf");
+}
+
+// ── FaultCollection — multi-failure aggregation ────────────────────────
+
+#[test]
+fn fault_collection_into_fault_children() {
+    let mut collection = FaultCollection::new();
+    assert!(collection.is_empty());
+    collection.push(Fault::new(chain(&["e1a", "e1b"])));
+    collection.push(Fault::new(TestErr));
+    assert_eq!(collection.len(), 2);
+    assert!(!collection.is_empty());
+
+    let agg = collection.into_fault(chain(&["agg"]));
+    assert_eq!(agg.to_string(), "agg");
+    let root = agg.frame();
+    assert_eq!(
+        root.children().len(),
+        2,
+        "both collected roots are children"
+    );
+    // iter() visits agg + both subtrees: agg, e1a, e1b, boom.
+    let names: Vec<String> = agg.iter().map(|fr| fr.error().to_string()).collect();
+    assert_eq!(names, ["agg", "e1a", "e1b", "boom"]);
+}
+
+#[test]
+fn collect_adapter() {
+    let results: Vec<core::result::Result<i32, Fault<TestErr>>> = vec![
+        Ok(1),
+        Err(Fault::new(TestErr)),
+        Ok(2),
+        Err(Fault::new(TestErr)),
+    ];
+    let failures = results
+        .into_iter()
+        .filter_map(core::result::Result::err)
+        .collect::<FaultCollection>();
+    assert_eq!(failures.len(), 2);
+}
+
+#[test]
+fn into_fault_msg_wraps_collected_under_plain_message() {
+    let failures = vec![Fault::new(TestErr)]
+        .into_iter()
+        .collect::<FaultCollection>();
+    let agg = failures.into_fault_msg("batch failed");
+    assert!(agg.to_string().contains("batch failed"));
+    assert_eq!(agg.frame().children().len(), 1);
+    assert_eq!(agg.iter().count(), 2, "message root + one subtree");
 }

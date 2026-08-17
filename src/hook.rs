@@ -11,9 +11,14 @@
 //! error type per second. [`init`] additionally wires logforth (only the
 //! appenders/diagnostics enabled by cargo features) and fastrace.
 //!
+//! A second hook family — [`add_capture_hook`] — runs DURING frame
+//! construction (before the frame is `Arc`'d) and may mutate the frame
+//! (attach data). Capture hooks are NOT throttled (they carry data; keep
+//! them cheap — the throttle governs sinks only).
+//!
 //! [`ObserveConfig::set_error_hook_throttle`]: crate::config::ObserveConfig::set_error_hook_throttle
 
-use crate::exn::Frame;
+use crate::exn::{Attachment, Frame};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -42,23 +47,27 @@ fn default_hook() -> Hook {
         // Hold the scope guard across the log — dropping it before the log
         // loses the span timing for the error path.
         let _span = crate::scope!("error");
-        // `Context::None` Displays as the literal "None"; omit the context
-        // part entirely for context-less errors instead of logging "— None".
+        // Structured kv fields (before the `;`) so JsonLayout/OTel emit
+        // fields, not strings. `Context::None` Displays as the literal
+        // "None"; omit the context part entirely for context-less errors
+        // instead of logging "— None".
         if matches!(frame.context, crate::exn::Context::None) {
             log::error!(
                 target: "fast_observe.error",
-                "{} at {}:{}",
-                frame.error,
-                frame.location.file(),
-                frame.location.line(),
+                error_type = frame.type_name(),
+                error_file = frame.location().file(),
+                error_line = frame.location().line();
+                "{}",
+                frame.error(),
             );
         } else {
             log::error!(
                 target: "fast_observe.error",
-                "{} at {}:{} — {}",
-                frame.error,
-                frame.location.file(),
-                frame.location.line(),
+                error_type = frame.type_name(),
+                error_file = frame.location().file(),
+                error_line = frame.location().line();
+                "{} — {}",
+                frame.error(),
                 frame.context,
             );
         }
@@ -88,6 +97,101 @@ pub fn clear_error_hooks() {
 /// Intended for testing/introspection.
 pub fn hooks_len() -> usize {
     hooks().lock().len()
+}
+
+// ── Capture hooks — run DURING frame construction, may mutate the frame ────
+
+type CaptureHook = Arc<dyn Fn(&mut Frame) + Send + Sync + 'static>;
+
+// Same snapshot-Arc pattern as `HOOKS`. INVARIANT: the initial vec always
+// holds the built-in capture hooks (trace context under feature `fastrace`,
+// then scope path), so they run for every frame without setup;
+// `add_capture_hook` only appends.
+static CAPTURE_HOOKS: OnceLock<Mutex<Arc<Vec<CaptureHook>>>> = OnceLock::new();
+
+fn capture_hooks() -> &'static Mutex<Arc<Vec<CaptureHook>>> {
+    CAPTURE_HOOKS.get_or_init(|| {
+        let built_ins: Vec<CaptureHook> = vec![
+            #[cfg(feature = "fastrace")]
+            trace_context_capture_hook(),
+            scope_path_capture_hook(),
+        ];
+        Mutex::new(Arc::new(built_ins))
+    })
+}
+
+/// Built-in capture hook (feature `fastrace`): attach the current trace id
+/// and emit an `error` span event so the error lands IN the trace timeline.
+/// Both parts no-op when no local parent span is active.
+#[cfg(feature = "fastrace")]
+fn trace_context_capture_hook() -> CaptureHook {
+    Arc::new(|frame: &mut Frame| {
+        if let Some(ctx) = fastrace::collector::SpanContext::current_local_parent() {
+            frame.push_attachment(Attachment::with_key("trace_id", ctx.trace_id));
+        }
+        // No-op when no local parent span is active (checked inside).
+        fastrace::local::LocalSpan::add_event(fastrace::Event::new("error").with_properties(
+            || {
+                use std::borrow::Cow;
+                [
+                    (Cow::Borrowed("type"), Cow::Borrowed(frame.type_name())),
+                    (
+                        Cow::Borrowed("location"),
+                        Cow::Owned(format!(
+                            "{}:{}",
+                            frame.location().file(),
+                            frame.location().line()
+                        )),
+                    ),
+                ]
+            },
+        ));
+    })
+}
+
+/// Built-in capture hook (always installed): attach the profiling scope path
+/// (`outer → … → leaf`) and the leaf scope's elapsed milliseconds. Pushes
+/// nothing when no scope is active.
+fn scope_path_capture_hook() -> CaptureHook {
+    Arc::new(|frame: &mut Frame| {
+        let path = crate::profiling::scope_path();
+        if !path.is_empty() {
+            frame.push_attachment(Attachment::with_key("scope_path", path.join(" → ")));
+        }
+        if let Some(ms) = crate::profiling::current_scope_elapsed_ms() {
+            frame.push_attachment(Attachment::with_key("scope_elapsed_ms", ms));
+        }
+    })
+}
+
+/// Append a capture hook. Capture hooks run DURING frame construction (on
+/// `&mut Frame`, before the frame is shared) and may attach data via
+/// [`Frame::push_attachment`]. The built-in hooks (trace context, scope
+/// path) always run first. A panicking capture hook is contained and does
+/// not prevent error construction or later hooks.
+///
+/// Capture hooks are NOT throttled — they carry data, not notifications.
+/// Keep them cheap; the throttle governs sink hooks ([`add_error_hook`])
+/// only. Call at startup; safe to call multiple times.
+pub fn add_capture_hook(hook: impl Fn(&mut Frame) + Send + Sync + 'static) {
+    let mut guard = capture_hooks().lock();
+    let mut new_vec = (**guard).clone();
+    new_vec.push(Arc::new(hook));
+    *guard = Arc::new(new_vec);
+}
+
+/// Run all capture hooks on a frame under construction. Called by
+/// `Frame::capture` BEFORE the frame is `Arc`'d and before [`invoke`].
+///
+/// Reentrancy discipline matches `invoke`: the snapshot Arc is cloned and
+/// the lock dropped BEFORE invoking, so a capture hook that itself
+/// constructs a `Fault` (reentrant `run_capture_hooks`) cannot deadlock.
+pub(crate) fn run_capture_hooks(frame: &mut Frame) {
+    let snapshot: Arc<Vec<CaptureHook>> = Arc::clone(&capture_hooks().lock());
+    for hook in snapshot.iter() {
+        // A panicking capture hook must never break error construction.
+        let _ = catch_unwind(AssertUnwindSafe(|| hook(frame)));
+    }
 }
 
 static DEFAULT_HOOK_ENABLED: AtomicBool = AtomicBool::new(true);

@@ -1,0 +1,29 @@
+[package]
+name = "fast-observe-macros"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Proc macros for fast-observe (instrument/all_functions/skip + error!)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+venial = "0.6"
+
+# Dev-only path dep on the parent (serde/serde_derive pattern): expansions
+# reference ::fast_observe, so integration tests need it in scope. Dev-deps
+# don't create publish cycles.
+[dev-dependencies]
+fast-observe = { path = "..", features = ["instant"] }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+panic = "deny"
