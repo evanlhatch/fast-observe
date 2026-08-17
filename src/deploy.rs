@@ -72,6 +72,41 @@ pub struct Deployment {
     /// present; without the feature (or on wasm) it is a documented no-op.
     #[builder(default = true)]
     flush_on_exit: bool,
+    /// Syslog appender on the unix socket `/dev/log` (feature `log-syslog`).
+    /// Default: `false`. The field is always present; without the feature
+    /// (or off-unix, where the crate has no unix-socket sender) `wire()`
+    /// warns on target `fast_observe.deploy` and skips the appender. A
+    /// missing/unreachable `/dev/log` also warns and skips.
+    #[builder(default)]
+    syslog: bool,
+    /// systemd journald appender (feature `log-journald`, unix-only — the
+    /// crate is an empty stub off-unix). Default: `false`. The field is
+    /// always present; without the feature (or off-unix) `wire()` warns on
+    /// target `fast_observe.deploy` and skips the appender. An unreachable
+    /// journald socket also warns and skips.
+    #[builder(default)]
+    journald: bool,
+    /// Wrap the stdout and file appenders in
+    /// `logforth_append_async::AsyncBuilder` (feature `log-async`) — logging
+    /// and flushing happen on a background worker thread. Default: `false`.
+    /// Without the feature `wire()` warns on target `fast_observe.deploy`
+    /// and the appenders stay synchronous.
+    #[builder(default)]
+    async_append: bool,
+    /// Add `logforth_diagnostic_task_local::TaskLocalDiagnostic` to the
+    /// dispatch diagnostics (feature `diag-task-local`). Default: `false`.
+    /// Without the feature `wire()` warns on target `fast_observe.deploy`
+    /// and skips the diagnostic.
+    #[builder(default)]
+    task_local_diagnostic: bool,
+    /// Use `logforth_filter_rustlog::RustLogFilter` (feature
+    /// `filter-rustlog`) as the dispatch filter INSTEAD of the fixed level
+    /// filter, reading the spec from `OBSERVE_LOG` → `RUST_LOG` (default
+    /// `info`). Default: `false`. `log::set_max_level` is still applied as
+    /// today, so it remains the global ceiling. Without the feature
+    /// `wire()` warns on target `fast_observe.deploy` and skips the filter.
+    #[builder(default)]
+    rust_log_filter: bool,
 }
 
 /// Stdout layout selector for [`Deployment::layout`].
@@ -85,6 +120,15 @@ pub enum LayoutChoice {
     /// One JSON object per line. Requires cargo feature `json`; without it
     /// the deployment warns and falls back to [`LayoutChoice::Text`].
     Json,
+    /// `key=value` logfmt lines. Requires cargo feature `layout-logfmt`;
+    /// without it the deployment warns and falls back to
+    /// [`LayoutChoice::Text`].
+    Logfmt,
+    /// Google Cloud Logging JSON (severity/trace fields per the GCL
+    /// structured-logging contract). Requires cargo feature `layout-gcl`;
+    /// without it the deployment warns and falls back to
+    /// [`LayoutChoice::Text`].
+    Gcl,
 }
 
 /// fastrace reporter selector for [`Deployment::traces`].
@@ -103,6 +147,7 @@ pub enum TracesChoice {
 
 /// Begin configuring the observability deployment — the entry point reads
 /// as a verb. Finish with [`DeploymentBuilder::init`].
+#[must_use]
 pub fn observe() -> DeploymentBuilder {
     Deployment::builder()
 }
@@ -147,6 +192,10 @@ impl Deployment {
         self.wire()
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one sequential pipeline: config → appenders → dispatch → reporter → hooks — splitting would scatter a single logical flow"
+    )]
     fn wire(self) -> Result<InitGuard, InitError> {
         let Self {
             level,
@@ -158,6 +207,11 @@ impl Deployment {
             traces,
             panic_hook,
             flush_on_exit,
+            syslog,
+            journald,
+            async_append,
+            task_local_diagnostic,
+            rust_log_filter,
         } = self;
 
         // Fields consumed only under their cargo feature — mark them read in
@@ -200,7 +254,34 @@ impl Deployment {
                     );
                     base
                 }
+                #[cfg(feature = "layout-logfmt")]
+                LayoutChoice::Logfmt => {
+                    base.with_layout(logforth_layout_logfmt::LogfmtLayout::default())
+                }
+                #[cfg(not(feature = "layout-logfmt"))]
+                LayoutChoice::Logfmt => {
+                    log::warn!(
+                        target: "fast_observe.deploy",
+                        "LayoutChoice::Logfmt requested but cargo feature `layout-logfmt` is not compiled in — using the text layout"
+                    );
+                    base
+                }
+                #[cfg(feature = "layout-gcl")]
+                LayoutChoice::Gcl => base.with_layout(
+                    logforth_layout_google_cloud_logging::GoogleCloudLoggingLayout::default(),
+                ),
+                #[cfg(not(feature = "layout-gcl"))]
+                LayoutChoice::Gcl => {
+                    log::warn!(
+                        target: "fast_observe.deploy",
+                        "LayoutChoice::Gcl requested but cargo feature `layout-gcl` is not compiled in — using the text layout"
+                    );
+                    base
+                }
             };
+            #[cfg(feature = "log-async")]
+            appends.push(maybe_async("fast-observe-log-stdout", stdout, async_append));
+            #[cfg(not(feature = "log-async"))]
             appends.push(Box::new(stdout));
         }
         #[cfg(feature = "fastrace")]
@@ -210,10 +291,66 @@ impl Deployment {
         #[cfg(all(feature = "web", target_arch = "wasm32"))]
         appends.push(Box::new(crate::profiling::web::WebConsoleAppend));
         #[cfg(feature = "file")]
-        if file_from_env {
-            if let Some(file) = file_appender() {
-                appends.push(Box::new(file));
+        if file_from_env && let Some(file) = file_appender() {
+            #[cfg(feature = "log-async")]
+            appends.push(maybe_async("fast-observe-log-file", file, async_append));
+            #[cfg(not(feature = "log-async"))]
+            appends.push(Box::new(file));
+        }
+        #[cfg(all(feature = "log-syslog", unix))]
+        if syslog {
+            match logforth_append_syslog::SyslogBuilder::unix("/dev/log") {
+                Ok(builder) => appends.push(Box::new(builder.build())),
+                Err(e) => log::warn!(
+                    target: "fast_observe.deploy",
+                    "failed to connect syslog socket /dev/log: {e} — skipping the syslog appender"
+                ),
             }
+        }
+        #[cfg(not(all(feature = "log-syslog", unix)))]
+        if syslog {
+            log::warn!(
+                target: "fast_observe.deploy",
+                "syslog requested but cargo feature `log-syslog` is not compiled in (or the target is not unix) — skipping the syslog appender"
+            );
+        }
+        #[cfg(all(feature = "log-journald", unix))]
+        if journald {
+            match logforth_append_journald::Journald::new() {
+                Ok(journald) => appends.push(Box::new(journald)),
+                Err(e) => log::warn!(
+                    target: "fast_observe.deploy",
+                    "journald unavailable: {e} — skipping the journald appender"
+                ),
+            }
+        }
+        #[cfg(not(all(feature = "log-journald", unix)))]
+        if journald {
+            log::warn!(
+                target: "fast_observe.deploy",
+                "journald requested but cargo feature `log-journald` is not compiled in (or the target is not unix) — skipping the journald appender"
+            );
+        }
+        #[cfg(not(feature = "log-async"))]
+        if async_append {
+            log::warn!(
+                target: "fast_observe.deploy",
+                "async_append requested but cargo feature `log-async` is not compiled in — appenders stay synchronous"
+            );
+        }
+        #[cfg(not(feature = "diag-task-local"))]
+        if task_local_diagnostic {
+            log::warn!(
+                target: "fast_observe.deploy",
+                "task_local_diagnostic requested but cargo feature `diag-task-local` is not compiled in — skipping the diagnostic"
+            );
+        }
+        #[cfg(not(feature = "filter-rustlog"))]
+        if rust_log_filter {
+            log::warn!(
+                target: "fast_observe.deploy",
+                "rust_log_filter requested but cargo feature `filter-rustlog` is not compiled in — skipping the filter"
+            );
         }
 
         // 3. Build the logforth pipeline, mirroring `hook::init()`'s
@@ -226,6 +363,18 @@ impl Deployment {
                 #[cfg(feature = "fastrace")]
                 let d = if traces_on {
                     d.diagnostic(logforth_diagnostic_fastrace::FastraceDiagnostic::default())
+                } else {
+                    d
+                };
+                #[cfg(feature = "diag-task-local")]
+                let d = if task_local_diagnostic {
+                    d.diagnostic(logforth_diagnostic_task_local::TaskLocalDiagnostic::default())
+                } else {
+                    d
+                };
+                #[cfg(feature = "filter-rustlog")]
+                let d = if rust_log_filter {
+                    d.filter(build_rust_log_filter())
                 } else {
                     d
                 };
@@ -285,7 +434,7 @@ pub struct DeploymentConfig {
     pub level: Option<String>,
     /// Stdout appender toggle.
     pub stdout: Option<bool>,
-    /// Stdout layout: `text` | `json` (case-insensitive).
+    /// Stdout layout: `text` | `json` | `logfmt` | `gcl` (case-insensitive).
     pub layout: Option<String>,
     /// Rolling file appender from `OBSERVE_LOG_DIR` (feature `file`).
     pub file_from_env: Option<bool>,
@@ -303,6 +452,17 @@ pub struct DeploymentConfig {
     /// Best-effort fastrace flush on process exit toggle (feature
     /// `flush-on-exit`, native only).
     pub flush_on_exit: Option<bool>,
+    /// Syslog appender toggle (feature `log-syslog`, unix socket sender).
+    pub syslog: Option<bool>,
+    /// systemd journald appender toggle (feature `log-journald`, unix only).
+    pub journald: Option<bool>,
+    /// Async stdout/file appender composition toggle (feature `log-async`).
+    pub async_append: Option<bool>,
+    /// Task-local diagnostic toggle (feature `diag-task-local`).
+    pub task_local_diagnostic: Option<bool>,
+    /// `RUST_LOG`-style per-module filter toggle (feature `filter-rustlog`);
+    /// replaces the fixed level filter.
+    pub rust_log_filter: Option<bool>,
 }
 
 impl DeploymentConfig {
@@ -332,6 +492,11 @@ impl DeploymentConfig {
             traces,
             panic_hook,
             flush_on_exit,
+            syslog,
+            journald,
+            async_append,
+            task_local_diagnostic,
+            rust_log_filter,
         } = self;
         let mut errors = Vec::new();
 
@@ -352,11 +517,13 @@ impl DeploymentConfig {
         let layout = layout.and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
             "text" => Some(LayoutChoice::Text),
             "json" => Some(LayoutChoice::Json),
+            "logfmt" => Some(LayoutChoice::Logfmt),
+            "gcl" => Some(LayoutChoice::Gcl),
             _ => {
                 errors.push(ConfigError {
                     field: "layout",
                     value,
-                    reason: "expected text|json",
+                    reason: "expected text|json|logfmt|gcl",
                 });
                 None
             }
@@ -392,35 +559,23 @@ impl DeploymentConfig {
 
         // Every field parsed — overlay onto the built deployment; `None`
         // leaves the builder's value untouched.
-        let mut deployment = builder.build();
-        if let Some(level) = level {
-            deployment.level = Some(level);
-        }
-        if let Some(stdout) = stdout {
-            deployment.stdout = stdout;
-        }
-        if let Some(layout) = layout {
-            deployment.layout = layout;
-        }
-        if let Some(file_from_env) = file_from_env {
-            deployment.file_from_env = file_from_env;
-        }
-        if let Some(backends) = backends {
-            deployment.backends = Some(backends);
-        }
-        if let Some(error_hook_throttle) = error_hook_throttle {
-            deployment.error_hook_throttle = Some(error_hook_throttle);
-        }
-        if let Some(traces) = traces {
-            deployment.traces = traces;
-        }
-        if let Some(panic_hook) = panic_hook {
-            deployment.panic_hook = panic_hook;
-        }
-        if let Some(flush_on_exit) = flush_on_exit {
-            deployment.flush_on_exit = flush_on_exit;
-        }
-        Ok(deployment)
+        let base = builder.build();
+        Ok(Deployment {
+            level: level.or(base.level),
+            stdout: stdout.unwrap_or(base.stdout),
+            layout: layout.unwrap_or(base.layout),
+            file_from_env: file_from_env.unwrap_or(base.file_from_env),
+            backends: backends.or(base.backends),
+            error_hook_throttle: error_hook_throttle.or(base.error_hook_throttle),
+            traces: traces.unwrap_or(base.traces),
+            panic_hook: panic_hook.unwrap_or(base.panic_hook),
+            flush_on_exit: flush_on_exit.unwrap_or(base.flush_on_exit),
+            syslog: syslog.unwrap_or(base.syslog),
+            journald: journald.unwrap_or(base.journald),
+            async_append: async_append.unwrap_or(base.async_append),
+            task_local_diagnostic: task_local_diagnostic.unwrap_or(base.task_local_diagnostic),
+            rust_log_filter: rust_log_filter.unwrap_or(base.rust_log_filter),
+        })
     }
 }
 
@@ -567,6 +722,38 @@ fn resolve_level(explicit: Option<log::LevelFilter>) -> log::LevelFilter {
     log::LevelFilter::Info
 }
 
+/// Wrap an appender in `logforth_append_async::AsyncBuilder` when `enabled`
+/// (feature `log-async`): logging and flushing move to a named background
+/// worker thread. Pass-through when `enabled` is false.
+#[cfg(feature = "log-async")]
+fn maybe_async(
+    thread_name: &'static str,
+    append: impl Into<Box<dyn logforth::Append>>,
+    enabled: bool,
+) -> Box<dyn logforth::Append> {
+    if enabled {
+        Box::new(
+            logforth_append_async::AsyncBuilder::new(thread_name)
+                .append(append)
+                .build(),
+        )
+    } else {
+        append.into()
+    }
+}
+
+/// The `RUST_LOG`-style per-module filter (feature `filter-rustlog`): spec
+/// from `OBSERVE_LOG`, else `RUST_LOG`, else `info`. Malformed directives
+/// are ignored by the filter builder (it warns to stderr).
+#[cfg(feature = "filter-rustlog")]
+fn build_rust_log_filter() -> logforth_filter_rustlog::RustLogFilter {
+    use logforth_filter_rustlog::RustLogFilterBuilder;
+    match std::env::var("OBSERVE_LOG") {
+        Ok(spec) => RustLogFilterBuilder::from_spec(spec).build(),
+        Err(_) => RustLogFilterBuilder::from_default_env_or("info").build(),
+    }
+}
+
 /// Rolling file appender, enabled by setting `OBSERVE_LOG_DIR` to a writable
 /// directory. Logs roll into `<dir>/app.log`.
 #[cfg(feature = "file")]
@@ -650,6 +837,11 @@ mod tests {
             .traces(TracesChoice::Off)
             .panic_hook(false)
             .flush_on_exit(false)
+            .syslog(true)
+            .journald(true)
+            .async_append(true)
+            .task_local_diagnostic(true)
+            .rust_log_filter(true)
             .build();
         assert_eq!(d.level, Some(log::LevelFilter::Debug));
         assert!(!d.stdout);
@@ -660,6 +852,21 @@ mod tests {
         assert!(matches!(d.traces, TracesChoice::Off));
         assert!(!d.panic_hook);
         assert!(!d.flush_on_exit);
+        assert!(d.syslog);
+        assert!(d.journald);
+        assert!(d.async_append);
+        assert!(d.task_local_diagnostic);
+        assert!(d.rust_log_filter);
+    }
+
+    #[test]
+    fn toggles_default_off() {
+        let d = observe().build();
+        assert!(!d.syslog);
+        assert!(!d.journald);
+        assert!(!d.async_append);
+        assert!(!d.task_local_diagnostic);
+        assert!(!d.rust_log_filter);
     }
 
     #[test]
@@ -674,6 +881,11 @@ mod tests {
             traces: Some("off".to_owned()),
             panic_hook: Some(false),
             flush_on_exit: Some(false),
+            syslog: Some(true),
+            journald: Some(true),
+            async_append: Some(true),
+            task_local_diagnostic: Some(true),
+            rust_log_filter: Some(true),
         };
         // Never `.init()` — the global logger is per-process.
         let Ok(d) = cfg.apply(observe()) else {
@@ -691,6 +903,11 @@ mod tests {
         assert!(matches!(d.traces, TracesChoice::Off));
         assert!(!d.panic_hook);
         assert!(!d.flush_on_exit);
+        assert!(d.syslog);
+        assert!(d.journald);
+        assert!(d.async_append);
+        assert!(d.task_local_diagnostic);
+        assert!(d.rust_log_filter);
     }
 
     #[test]

@@ -33,11 +33,12 @@ pub use diagnostic::{
 };
 pub use errors::{
     CategoryTag, Coded, ERROR_REGISTRY, ErrorCode, ErrorRegistryEntry, doctor, error_registry,
-    lookup_error,
+    lookup_error, register_statics,
 };
 pub use exn::{
     Attachment, BoxError, Context, ErrorExt, Fault, FaultCollection, Frame, FrameIter,
-    InternalError, OptionExt, Placement, Result, ResultExt, SimpleError, error_counts,
+    InternalError, OptionExt, Placement, Result, ResultExt, error_counts, error_counts_by_category,
+    retry_with_policy,
 };
 pub use hook::{
     add_capture_hook, add_error_hook, clear_error_hooks, hooks_len, init, set_default_hook_enabled,
@@ -121,9 +122,9 @@ pub mod prelude {
     pub use crate::{
         Attachment, BoxError, Category, Coded, Context, ErrorCategory, ErrorExt, Fault,
         FaultCollection, Frame, InternalError, OptionExt, Placement, Policy, Result, ResultExt,
-        SimpleError, add_capture_hook, add_error_hook, all_functions, bail, define_errors, doctor,
-        ensure, error, error_counts, error_registry, finish_frame, init, instrument, lookup_error,
-        observe, render_report, report_display, scope, skip,
+        add_capture_hook, add_error_hook, all_functions, bail, doctor, ensure, error, error_counts,
+        error_registry, finish_frame, init, instrument, lookup_error, observe, render_report,
+        report_display, scope, skip,
     };
 }
 
@@ -141,5 +142,7 @@ pub mod __private {
 pub use fastrace_reqwest;
 #[cfg(feature = "bridge-tracing")]
 pub use fastrace_tracing;
+#[cfg(feature = "otel")]
+pub use hook::init_otel;
 #[cfg(feature = "otel")]
 pub use {fastrace_opentelemetry, logforth_append_opentelemetry};

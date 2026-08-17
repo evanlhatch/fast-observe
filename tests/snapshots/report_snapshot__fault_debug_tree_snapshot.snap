@@ -1,0 +1,7 @@
+---
+source: tests/report_snapshot.rs
+expression: "redact_location(&format!(\"{fault:?}\"))"
+---
+[E999] snap boom, at [LOCATION] [loading snapshot]
+|-- * attempt: 3
+`-- snap leaf blew up, at [LOCATION]

@@ -20,11 +20,12 @@ id, caller location). Wasm-safe, including `wasm32-unknown-unknown`.
   **set** (`Backends` mask): fastrace, instant, web — plus Tier-2
   profilers (puffin, tracy, superluminal, tracing) compiled in via
   `profile-with-*` features. ~2ns when the mask is off.
-- **`define_errors!`** — error structs, `Display`/`Error`,
-  `code()`/`category()`, and link-time registration in a global error
-  registry, so `lookup_error` / `doctor` work workspace-wide. (The
-  thiserror-style `error!` proc macro is landing; `define_errors!` is the
-  current path.)
+- **`error!`** — declarative typed errors: thiserror-compatible
+  attributes (`#[error]`/`#[from]`/`#[source]`) plus
+  `#[code]`/`#[category]`/`#[advice]`; generates the enum, structs,
+  Display/Error (with `source()` wiring + `Error::provide` of code and
+  category), `From` conversions, and link-time registration in the
+  global error registry so `lookup_error` / `doctor` work workspace-wide.
 - **`Diagnostic`** — ariadne-rendered compile-time-style diagnostics with
   source spans, multi-label, and in-memory sources; `render_diagnostic`
   returns a `String`.
@@ -47,29 +48,26 @@ The repo's devenv pins the toolchain.
 ## Quickstart
 
 ```rust,no_run
+#![feature(error_generic_member_access)] // error! emits Error::provide
 use fast_observe::exn::Result;
-use fast_observe::{define_errors, init, lookup_error, scope};
+use fast_observe::{error, init, lookup_error, scope};
 
-#[derive(Debug)]
-enum AppError {
-    Disk(Disk),
-}
-impl std::error::Error for AppError {}
-
-define_errors! {
-    enum AppError {
-        (Disk, "E100", Transient, "disk read failed", "disk read failed: {path}", {
-            path: String,
-        });
+error! {
+    pub enum AppError {
+        /// Disk read failed.
+        #[error("disk read failed: {path}")]
+        #[code = "E100", category = Transient, advice = "check the path exists"]
+        Disk { path: String },
     }
 }
 
-fn load(path: &str) -> Result<(), Disk> {
+fn load(path: &str) -> Result<(), AppError> {
     let _span = scope!("load"); // interval: feeds the selected profiler set
     log::info!(path = path; "loading"); // point: plain log macros, kv becomes fields
     if path.is_empty() {
-        fast_observe::bail!(Disk { path: path.to_string() }); // value: construct
-        // + count + span event + log in one verb — never log::error! + return Err
+        // value: construct + count + span event + log in one verb —
+        // never log::error! + return Err
+        fast_observe::bail!(AppError::Disk(Disk { path: path.to_string() }));
     }
     Ok(())
 }
@@ -78,12 +76,13 @@ fn main() {
     init(); // logforth (stdout/fastrace/json/file/web per features) + fastrace reporter
 
     if let Err(f) = load("") {
-        eprintln!("{f:?}"); // causal tree: locations, scope path, trace id, causes
+        eprintln!("{f:?}"); // causal tree: [code], locations, scope path, trace id
     }
 
     // Doctor-style lookup across every linked crate's error definitions:
     let entry = lookup_error("E100").unwrap();
-    assert_eq!(entry.display, "disk read failed");
+    assert_eq!(entry.name, "Disk");
+    assert_eq!(entry.advice, Some("check the path exists"));
 }
 ```
 

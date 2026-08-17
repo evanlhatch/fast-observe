@@ -1,0 +1,11 @@
+---
+source: tests/report_snapshot.rs
+expression: redact_location(&render_report(&fault))
+---
+error: [E999] snap boom (loading snapshot)
+category: Content (policy: fix the input; retrying unchanged input will fail)
+location: [LOCATION]
+attachment: attempt=3
+cause 0: [E999] snap boom (loading snapshot)
+cause 1: snap leaf blew up
+action: fix the input; retrying unchanged input will fail; see `doctor E999`

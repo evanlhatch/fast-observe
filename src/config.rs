@@ -53,6 +53,7 @@ impl Backends {
     pub const SUPERLUMINAL: Self = Self(1 << 6);
     pub const TRACING: Self = Self(1 << 7);
 
+    #[must_use]
     pub const fn empty() -> Self {
         Self::OFF
     }
@@ -149,6 +150,7 @@ impl ObserveConfig {
     }
 
     /// Read the active profiling backend set (hot-path, relaxed atomic).
+    #[must_use]
     pub fn backends(&self) -> Backends {
         Backends(self.backends.load(Ordering::Relaxed))
     }
@@ -226,6 +228,7 @@ impl ObserveConfig {
     }
 
     /// Read the error-hook throttle (0 = unlimited).
+    #[must_use]
     pub fn error_hook_throttle(&self) -> u32 {
         self.error_hook_throttle.load(Ordering::Relaxed)
     }

@@ -58,7 +58,7 @@ fn coded_fault() -> Fault<CodedBoom> {
     Fault::new(CodedBoom {
         source: Some(InnerBoom),
     })
-    .with_context(Context::custom("loading entity"))
+    .set_context(Context::custom("loading entity"))
     .attach_key("attempt", 3)
 }
 

@@ -1,0 +1,5 @@
+error: duplicate error code "E903" within this enum
+  --> tests/ui/duplicate_codes.rs:17:18
+   |
+17 |         #[code = "E903", category = Transient]
+   |                  ^^^^^^

@@ -62,16 +62,19 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     /// An error diagnostic with code + message; no spans or advice.
+    #[must_use]
     pub fn error(code: &str, message: impl Into<String>) -> Self {
         Self::new(code, message, Severity::Error)
     }
 
     /// A warning diagnostic with code + message; no spans or advice.
+    #[must_use]
     pub fn warning(code: &str, message: impl Into<String>) -> Self {
         Self::new(code, message, Severity::Warning)
     }
 
     /// An info diagnostic with code + message; no spans or advice.
+    #[must_use]
     pub fn info(code: &str, message: impl Into<String>) -> Self {
         Self::new(code, message, Severity::Info)
     }

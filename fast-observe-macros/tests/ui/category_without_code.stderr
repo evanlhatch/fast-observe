@@ -1,0 +1,5 @@
+error: `category` requires `#[code]` — uncoded variants take neither
+  --> tests/ui/category_without_code.rs:12:22
+   |
+12 |         #[category = Content]
+   |                      ^^^^^^^

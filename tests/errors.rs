@@ -1,35 +1,40 @@
-//! `define_errors!` + global `ERROR_REGISTRY`. This binary links ONLY
-//! fast-observe, so the registry contents here are exactly what this test
-//! file registers — cross-crate visibility is proven by the consuming
-//! workspace's own registry tests.
+//! `error!` + global `ERROR_REGISTRY`. This binary links ONLY fast-observe,
+//! so the registry contents here are exactly what this test file registers —
+//! cross-crate visibility is proven by the consuming workspace's own registry
+//! tests. `error!` registration resolves through `fast_observe::__private` —
+//! consumers need NO linkme dependency.
 
-use fast_observe::errors::doctor;
-use fast_observe::{ErrorCategory, Policy, define_errors, error_registry, lookup_error};
+#![feature(error_generic_member_access)]
 
-/// Test error enum — exercises the macro outside any app crate.
-#[derive(Debug)]
-pub enum TestError {
-    Boom(Boom),
-    Fizzle(Fizzle),
-}
+use fast_observe::errors::{ErrorCode, doctor};
+use fast_observe::{ErrorCategory, Fault, Policy, error_registry, lookup_error};
 
-define_errors! {
-    enum TestError {
-        (Boom, "E991", Invariant, "boom", "boom: {detail}", {
+fast_observe::error! {
+    /// Errors of the registry test.
+    #[derive(Debug)]
+    pub enum TestError {
+        /// boom with details
+        #[error("boom: {detail}")]
+        #[code = "E991", category = Invariant]
+        #[advice = "do not panic; check the detonator"]
+        Boom {
+            /// What went boom.
             detail: String,
-        });
-        (Fizzle, "E992", Transient, "fizzle", "fizzle", {});
+        },
+
+        /// retry the fizzle
+        #[error("fizzle")]
+        #[code = "E992", category = Transient]
+        Fizzle {},
     }
 }
-
-impl std::error::Error for TestError {}
 
 #[test]
 fn lookup_finds_registered_variants() {
     let entry = lookup_error("E991").expect("E991 registered");
     assert_eq!(entry.name, "Boom");
     assert_eq!(entry.category, ErrorCategory::Invariant);
-    assert_eq!(entry.display, "boom");
+    assert_eq!(entry.display, "boom: {detail}");
     assert!(lookup_error("E999").is_none());
 }
 
@@ -57,15 +62,39 @@ fn registry_iterates_all_local_entries() {
 }
 
 #[test]
-fn entry_has_module_path() {
+fn entry_has_module_path_and_advice() {
     let entry = lookup_error("E991").expect("E991 registered");
     assert!(
         entry.module.ends_with("errors"),
         "module was {}",
         entry.module
     );
-    // Legacy macro entries carry no advice.
-    assert_eq!(entry.advice, None);
+    // Explicit #[advice] lands in the entry.
+    assert_eq!(entry.advice, Some("do not panic; check the detonator"));
+
+    // Without #[advice], the first doc-comment line is the advice.
+    let fizzle = lookup_error("E992").expect("E992 registered");
+    assert_eq!(fizzle.advice, Some("retry the fizzle"));
+}
+
+#[test]
+fn entries_slice_lists_coded_variants() {
+    assert_eq!(TestError::ENTRIES.len(), 2);
+    assert!(TestError::ENTRIES.iter().any(|e| e.code == "E991"));
+    assert!(TestError::ENTRIES.iter().any(|e| e.code == "E992"));
+}
+
+#[test]
+fn provide_roundtrip_through_fault_frame() {
+    let fault: Fault<TestError> = Boom {
+        detail: "x".to_string(),
+    }
+    .into();
+    let err = fault.frame().error();
+    assert_eq!(
+        core::error::request_value::<ErrorCode>(err),
+        Some(ErrorCode("E991"))
+    );
 }
 
 #[test]
@@ -75,10 +104,16 @@ fn doctor_renders_known_code() {
     assert!(report.contains("name: Boom"), "report:\n{report}");
     assert!(report.contains("category: Invariant"), "report:\n{report}");
     assert!(report.contains("policy: "), "report:\n{report}");
-    assert!(report.contains("display: boom"), "report:\n{report}");
+    assert!(
+        report.contains("display: boom: {detail}"),
+        "report:\n{report}"
+    );
     assert!(report.contains("module: "), "report:\n{report}");
-    // No advice on legacy entries — no advice line rendered.
-    assert!(!report.contains("advice: "), "report:\n{report}");
+    // #[advice] lands in the entry — doctor renders the advice line.
+    assert!(
+        report.contains("advice: do not panic; check the detonator"),
+        "report:\n{report}"
+    );
     assert!(doctor("E999").is_none());
 }
 

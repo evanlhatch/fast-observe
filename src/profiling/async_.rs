@@ -24,6 +24,7 @@ use std::future::Future;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt as _;
 use fastrace::local::LocalParentGuard;
+use sealed::sealed;
 
 /// `Stream`/`Sink` tracing adapters from `fastrace-futures`
 /// (`StreamExt::in_span`, …). `Future` instrumentation needs no extra crate —
@@ -74,12 +75,15 @@ pub fn in_observed_span<F: Future>(name: &'static str, f: F) -> impl Future<Outp
 /// Extension trait so futures can be wrapped fluently:
 /// `my_future.in_observed_span("load")`.
 ///
-/// See [`in_observed_span`] for semantics.
+/// See [`in_observed_span`] for semantics. Sealed: blanket-implemented for
+/// every [`Future`] — not intended for user implementation.
+#[sealed]
 pub trait ObservedFutureExt: Future + Sized {
     /// Wrap `self` in a fastrace span entered on every poll.
     fn in_observed_span(self, name: &'static str) -> impl Future<Output = Self::Output>;
 }
 
+impl<F: Future> __seal_observed_future_ext::Sealed for F {}
 impl<F: Future> ObservedFutureExt for F {
     fn in_observed_span(self, name: &'static str) -> impl Future<Output = F::Output> {
         in_observed_span(name, self)

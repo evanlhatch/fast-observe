@@ -97,6 +97,7 @@ pub fn clear_error_hooks() {
 
 /// Number of registered error hooks (default hook included).
 /// Intended for testing/introspection.
+#[must_use]
 pub fn hooks_len() -> usize {
     hooks().lock().len()
 }

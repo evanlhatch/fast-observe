@@ -10,6 +10,7 @@
 
 use std::fmt;
 
+use sealed::sealed;
 use tokio::task::JoinError;
 
 /// Why a joined task failed — the typed distinction on [`JoinTaskError`].
@@ -99,10 +100,10 @@ fn panic_payload(e: JoinError) -> Option<String> {
 /// via `Fault`'s `Deref`) and as string attachments on the root frame
 /// (`task: <name>`, `join: cancelled|panic`).
 ///
-/// The error type is [`JoinTaskError`], not the `SimpleError` default:
-/// `Fault<SimpleError>` has no `Error` impl (`Box<dyn Error>` is unsized),
+/// The error type is [`JoinTaskError`], not the `BoxError` default:
+/// `Fault<BoxError>` has no `Error` impl (`Box<dyn Error>` is unsized),
 /// which `Fault::attach_key` requires. Convert with
-/// `ResultExt::wrap_msg` when a `Fault<SimpleError>` is needed.
+/// `ResultExt::context` when a `Fault<BoxError>` is needed.
 ///
 /// ```no_run
 /// use fast_observe::tokio_ext::ObserveJoinExt;
@@ -118,6 +119,10 @@ fn panic_payload(e: JoinError) -> Option<String> {
 /// mapping — `int-tokio` does not enable tokio's `rt` feature (needed even
 /// to CONSTRUCT a `JoinError`), and dev-dependencies cannot add features.
 /// A real spawn/panic/abort test lands when a consumer enables `tokio/rt`.
+///
+/// Sealed: implemented only for `Result<T, JoinError>` (the output of
+/// `JoinHandle::await`) — not intended for user implementation.
+#[sealed]
 pub trait ObserveJoinExt<T> {
     /// Map `Err(JoinError)` into a `Fault<JoinTaskError>` distinguishing
     /// cancellation from panic; `Ok` passes through untouched.
@@ -130,6 +135,7 @@ pub trait ObserveJoinExt<T> {
     fn observe_join(self, task: &'static str) -> crate::Result<T, JoinTaskError>;
 }
 
+impl<T> __seal_observe_join_ext::Sealed<T> for Result<T, JoinError> {}
 impl<T> ObserveJoinExt<T> for Result<T, JoinError> {
     #[track_caller]
     #[cold]

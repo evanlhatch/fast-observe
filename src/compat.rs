@@ -5,10 +5,10 @@
 
 /// anyhow ↔ `Fault` boundary (feature `anyhow-boundary`).
 ///
-/// Note: `Fault<SimpleError>` (`SimpleError` = `Box<dyn Error + Send +
+/// Note: `Fault<BoxError>` (`BoxError` = `Box<dyn Error + Send +
 /// Sync>`) cannot go through [`into_anyhow`]: std's `impl<E: Error> Error
 /// for Box<E>` requires `E: Sized`, so boxed errors are not `Error` and
-/// `Fault<SimpleError>` has no `Error` impl. Convert typed faults only.
+/// `Fault<BoxError>` has no `Error` impl. Convert typed faults only.
 ///
 /// [`into_anyhow`]: anyhow_boundary::into_anyhow
 #[cfg(feature = "anyhow-boundary")]
@@ -67,7 +67,7 @@ pub mod anyhow_boundary {
 ///
 /// Mirrors [`anyhow_boundary`]: eyre erases its sources into its own
 /// representation exactly like anyhow, so the same erased-chain caveat
-/// applies — and the same `Fault<SimpleError>` restriction on
+/// applies — and the same `Fault<BoxError>` restriction on
 /// [`into_eyre`] (typed faults only).
 ///
 /// [`into_eyre`]: eyre_boundary::into_eyre

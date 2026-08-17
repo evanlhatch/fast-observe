@@ -32,6 +32,26 @@ fastrace = [
 otel = ["fastrace", "dep:fastrace-opentelemetry", "dep:logforth-append-opentelemetry"]
 # JSON layout for the stdout appender.
 json = ["dep:logforth-layout-json"]
+# logfmt layout for the stdout appender.
+layout-logfmt = ["dep:logforth-layout-logfmt"]
+# Google Cloud Logging layout for the stdout appender.
+layout-gcl = ["dep:logforth-layout-google-cloud-logging"]
+# Plain-text layout re-export (the default text layout is built into logforth;
+# this is for custom pipelines).
+layout-text = ["dep:logforth-layout-text"]
+# Syslog appender (native-only default: unix socket /dev/log; the crate itself
+# compiles everywhere — off-unix the toggle warns and skips).
+log-syslog = ["dep:logforth-append-syslog"]
+# systemd journald appender (unix-only: the crate is an empty stub off-unix,
+# so the toggle warns and skips there).
+log-journald = ["dep:logforth-append-journald"]
+# Async appender composition (background worker thread) for stdout + file.
+log-async = ["dep:logforth-append-async"]
+# RUST_LOG-style per-module filter (OBSERVE_LOG → RUST_LOG) replacing the fixed
+# level filter.
+filter-rustlog = ["dep:logforth-filter-rustlog"]
+# Task-local diagnostic (per-task diagnostic context) on the dispatch.
+diag-task-local = ["dep:logforth-diagnostic-task-local"]
 # Rolling file appender (enabled in init() when OBSERVE_LOG_DIR is set).
 file = ["dep:logforth-append-file"]
 # Re-export the log ↔ logforth bridge for custom logger pipelines.
@@ -94,6 +114,14 @@ logforth-diagnostic-fastrace = { version = "0.4", optional = true }
 fastrace-opentelemetry = { version = "0.18", optional = true }
 logforth-append-opentelemetry = { version = "0.4", optional = true }
 logforth-layout-json = { version = "0.4", optional = true }
+logforth-layout-logfmt = { version = "0.4", optional = true }
+logforth-layout-google-cloud-logging = { version = "0.4", optional = true }
+logforth-layout-text = { version = "0.4", optional = true }
+logforth-append-syslog = { version = "0.4", optional = true }
+logforth-append-journald = { version = "0.4", optional = true }
+logforth-append-async = { version = "0.4", optional = true }
+logforth-filter-rustlog = { version = "0.4", optional = true }
+logforth-diagnostic-task-local = { version = "0.4", optional = true }
 logforth-append-file = { version = "0.4", optional = true }
 fastrace-tracing = { version = "0.1", optional = true }
 fastrace-reqwest = { version = "0.3", optional = true }
@@ -111,6 +139,7 @@ tokio = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
 serde_json = "1"
+insta = "1"
 # Doctests/tests using define_errors! need linkme in scope (non-wasm).
 linkme = "0.3"
 

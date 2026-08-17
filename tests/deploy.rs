@@ -90,6 +90,11 @@ fn full_config() -> DeploymentConfig {
         traces: Some("off".to_owned()),
         panic_hook: Some(false),
         flush_on_exit: Some(false),
+        syslog: Some(true),
+        journald: Some(true),
+        async_append: Some(true),
+        task_local_diagnostic: Some(true),
+        rust_log_filter: Some(true),
     }
 }
 

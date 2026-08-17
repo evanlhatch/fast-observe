@@ -1,7 +1,7 @@
 //! Exception type with causal tree + typed context.
 //!
 //! `Fault<E>` wraps error `E` + causal tree. Reflexive `From<E> for Fault<E>`.
-//! Context attachment via `with_context`. Cross-type via `change_context`.
+//! Context attachment via `set_context`. Cross-type via `change_context`.
 //!
 //! How `?` works: `From<E>` covers `Result<T, E>` → `Result<T, Fault<E>>`.
 //! Cross-type needs `.change_context(EngineError::from)?`.
@@ -97,7 +97,6 @@ fn category_key(category: Option<crate::ErrorCategory>) -> &'static str {
 
 /// A boxed error — the default `E` for `Fault` / `Result`.
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
-pub type SimpleError = BoxError;
 
 // ── Context — generic, reusable error context ──────────────────────────────
 
@@ -414,7 +413,7 @@ impl Error for Frame {
 
 /// An exception carrying a causal tree of [`Frame`]s.
 #[must_use = "a Fault is an error — return it, handle it, or swallow it explicitly via `ResultExt::report`"]
-pub struct Fault<E: Send + Sync + Sized + 'static = SimpleError> {
+pub struct Fault<E: Send + Sync + Sized + 'static = BoxError> {
     root: Arc<Frame>,
     /// The typed error — the `Deref` target. Shared with the root frame via a
     /// delegating wrapper, so deref never downcasts (and can never panic).
@@ -473,8 +472,8 @@ impl<E: Error + Send + Sync + Sized + 'static> From<E> for Fault<E> {
     }
 }
 
-impl Fault<SimpleError> {
-    /// Create a `Fault<SimpleError>` from a boxed error.
+impl Fault<BoxError> {
+    /// Create a `Fault<BoxError>` from a boxed error.
     #[track_caller]
     #[cold]
     pub fn from_boxed(error: BoxError) -> Self {
@@ -495,14 +494,14 @@ impl Fault<SimpleError> {
     }
 }
 
-impl From<&str> for Fault<SimpleError> {
+impl From<&str> for Fault<BoxError> {
     #[track_caller]
     fn from(msg: &str) -> Self {
         Self::from_boxed(internal_err(msg.to_string()))
     }
 }
 
-impl From<String> for Fault<SimpleError> {
+impl From<String> for Fault<BoxError> {
     #[track_caller]
     fn from(msg: String) -> Self {
         Self::from_boxed(internal_err(msg))
@@ -535,13 +534,13 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     /// constructed the fault or received it by value). On a shared root the
     /// context would be silently dropped — that is a bug, and debug builds
     /// say so.
-    pub fn with_context(mut self, ctx: Context) -> Self {
+    pub fn set_context(mut self, ctx: Context) -> Self {
         if let Some(frame) = Arc::get_mut(&mut self.root) {
             frame.context = ctx;
         } else {
             debug_assert!(
                 Arc::strong_count(&self.root) == 1,
-                "with_context on a shared Fault root — context would be lost"
+                "set_context on a shared Fault root — context would be lost"
             );
         }
         self
@@ -551,7 +550,7 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     ///
     /// The display string is computed once, here; the typed value stays
     /// reachable via [`Fault::find_attachment`]. Same unique-root rule as
-    /// [`Fault::with_context`].
+    /// [`Fault::set_context`].
     pub fn attach<A: fmt::Display + Send + Sync + 'static>(self, value: A) -> Self {
         self.attach_inner(None, value, Placement::Inline)
     }
@@ -574,7 +573,7 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
         self.attach_inner(None, value, placement)
     }
 
-    /// The single attachment mutation path — see [`Fault::with_context`]
+    /// The single attachment mutation path — see [`Fault::set_context`]
     /// for the shared-root rule.
     fn attach_inner<A: fmt::Display + Send + Sync + 'static>(
         mut self,
@@ -638,7 +637,7 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
 }
 
 /// Frame accessors that need no `E: Error` bound — kept outside the
-/// `E: Error` impl block so `Fault<SimpleError>` (`Box<dyn Error>` does not
+/// `E: Error` impl block so `Fault<BoxError>` (`Box<dyn Error>` does not
 /// itself implement `Error`) and [`FaultCollection`] can use them.
 impl<E: Send + Sync + Sized + 'static> Fault<E> {
     /// The root frame (shared via Arc).
@@ -710,7 +709,7 @@ fn frame_category(frame: &Frame) -> Option<crate::ErrorCategory> {
 /// return immediately with the fault unchanged. On exhaustion the earlier
 /// attempts are merged under the FINAL attempt's fault — the typed `E` is
 /// preserved, so [`FaultCollection::into_fault_msg`] (which erases `E` to
-/// [`SimpleError`]) cannot be used; the exhaustion message
+/// [`BoxError`]) cannot be used; the exhaustion message
 /// `"{label}: failed after {n} attempts"` rides in the final fault's
 /// [`Context::Custom`] instead of a new root, and the collected attempts
 /// become children of its root frame.
@@ -789,7 +788,7 @@ impl<E: Send + Sync + Sized + 'static> fmt::Display for Fault<E> {
 // ── Result type alias ──────────────────────────────────────────────────────
 
 /// `Result<T, Fault<E>>` — the standard return type.
-pub type Result<T, E = SimpleError> = core::result::Result<T, Fault<E>>;
+pub type Result<T, E = BoxError> = core::result::Result<T, Fault<E>>;
 
 // ── FaultCollection — multi-failure aggregation ────────────────────────────
 
@@ -840,7 +839,7 @@ impl FaultCollection {
     }
 
     /// Same as [`FaultCollection::into_fault`] but the root is a plain
-    /// message (`Fault<SimpleError>`).
+    /// message (`Fault<BoxError>`).
     #[track_caller]
     pub fn into_fault_msg(self, msg: impl Into<Cow<'static, str>>) -> Fault {
         let mut fault = Fault::from_boxed(internal_err(msg));
@@ -908,26 +907,22 @@ pub trait ResultExt {
     where
         A: Error + Send + Sync + Sized + 'static;
 
-    /// Convert any error to `Fault<SimpleError>` with a message.
+    /// Convert any error to `Fault<BoxError>` with a message (anyhow's verb).
     ///
     /// # Errors
     ///
-    /// Returns `Err(Fault<SimpleError>)` with `msg` when `self` is `Err`.
+    /// Returns `Err(Fault<BoxError>)` with `msg` when `self` is `Err`.
     #[track_caller]
-    fn wrap_msg(self, msg: impl Into<Cow<'static, str>>) -> Result<Self::Success>;
+    fn context(self, msg: impl Into<Cow<'static, str>>) -> Result<Self::Success>;
 
-    /// Observe this error through the full observability stack (profiling span
-    /// + structured log), then return `Result<T, Fault<E>>` — full type preservation.
+    /// Lazy form of [`ResultExt::context`] — the closure runs ONLY on Err
+    /// (Ok pays nothing; anyhow's `with_context`).
     ///
     /// # Errors
     ///
-    /// Returns `Err(Fault<E>)` carrying the observation message as context
-    /// when `self` is `Err`.
+    /// Returns `Err(Fault<BoxError>)` with `f()` when `self` is `Err`.
     #[track_caller]
-    fn observed(
-        self,
-        msg: impl Into<Cow<'static, str>>,
-    ) -> core::result::Result<Self::Success, Fault<Self::Error>>;
+    fn with_context(self, f: impl FnOnce() -> Cow<'static, str>) -> Result<Self::Success>;
 
     /// Attach debugging data when Err. On Ok the value passes through untouched.
     ///
@@ -987,7 +982,7 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
 
     #[track_caller]
     #[cold]
-    fn wrap_msg(self, msg: impl Into<Cow<'static, str>>) -> Result<T> {
+    fn context(self, msg: impl Into<Cow<'static, str>>) -> Result<T> {
         match self {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -1006,26 +1001,11 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
     }
 
     #[track_caller]
-    fn observed(self, msg: impl Into<Cow<'static, str>>) -> core::result::Result<T, Fault<E>> {
+    #[cold]
+    fn with_context(self, f: impl FnOnce() -> Cow<'static, str>) -> Result<T> {
         match self {
             Ok(v) => Ok(v),
-            Err(e) => {
-                let msg = msg.into();
-                // The original error stays the ROOT — the message rides in
-                // the context, and the nested source chain stays as children
-                // (both via the single capture path).
-                let mut fault = Fault::capture_typed(e, Location::caller());
-                let scope = crate::profiling::current_scope_name().unwrap_or(Cow::Borrowed(""));
-                let context = if scope.is_empty() {
-                    Context::Custom(msg)
-                } else {
-                    Context::Custom(format!("{scope}: {msg}").into())
-                };
-                if let Some(root) = Arc::get_mut(&mut fault.root) {
-                    root.context = context;
-                }
-                Err(fault)
-            }
+            Err(e) => Err(e).context(f()),
         }
     }
 
@@ -1079,7 +1059,7 @@ pub trait OptionExt {
 
     /// # Errors
     ///
-    /// Returns `Err(Fault<SimpleError>)` with `msg` when `self` is `None`.
+    /// Returns `Err(Fault<BoxError>)` with `msg` when `self` is `None`.
     #[track_caller]
     fn ok_or_msg(self, msg: impl Into<Cow<'static, str>>) -> Result<Self::Some>;
 }
@@ -1097,7 +1077,13 @@ impl<T> OptionExt for Option<T> {
     }
 }
 
-/// A simple internal error for `ok_or_msg` and manual Frame construction.
+/// A simple internal error for `ok_or_msg`, `bail!`-style message errors,
+/// and stringified source-chain frames.
+///
+/// Public (and re-exported at the crate root) so callers can name it —
+/// e.g. downcast a [`Fault`]'s root error or match the error type produced
+/// by [`OptionExt::ok_or_msg`]. Construction stays crate-private via
+/// `internal_err`; there are no public constructors.
 #[derive(Debug)]
 pub struct InternalError(Cow<'static, str>);
 
@@ -1116,7 +1102,7 @@ impl Error for InternalError {}
 /// Bail with an error. Two forms:
 ///
 /// ```ignore
-/// bail!("something: {x}");                    // → Fault<SimpleError>
+/// bail!("something: {x}");                    // → Fault<BoxError>
 /// bail!(Internal, "something: {x}");           // → Fault<Internal> with format! detail
 /// bail!(Internal { detail: "...".into() });    // → Fault<Internal> from struct
 /// ```

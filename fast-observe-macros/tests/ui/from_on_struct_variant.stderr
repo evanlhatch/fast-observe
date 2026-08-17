@@ -1,0 +1,5 @@
+error: `#[from]` on a struct variant is unsupported — mark a field with `#[source]` instead
+  --> tests/ui/from_on_struct_variant.rs:13:9
+   |
+13 |         Wrapped {
+   |         ^^^^^^^

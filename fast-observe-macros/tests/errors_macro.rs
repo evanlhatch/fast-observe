@@ -207,3 +207,75 @@ fn entries_list_all_coded_variants() {
     assert_eq!(EngineError::ENTRIES.len(), 3);
     assert!(EngineError::ENTRIES.iter().any(|e| e.code == "E503"));
 }
+
+// ── Debug on the generated enum ─────────────────────────────────────────
+//
+// `impl Error` requires `Debug + Display`, and `Result::unwrap_err`
+// requires `E: Debug` — the macro must guarantee the enum is `Debug`
+// whether the user derives nothing, `Debug` themselves, or something else.
+
+// No derive on the enum — the macro must add `#[derive(Debug)]`.
+fast_observe_macros::error! {
+    /// Derive-less enum — the macro adds `Debug`.
+    pub enum PlainError {
+        /// a plain failure
+        #[error("plain failure: {id}")]
+        Plain {
+            /// The failing id.
+            id: u64,
+        },
+    }
+}
+
+// A user derive that is NOT `Debug` — must still end up `Debug`-able.
+// (Unit variant: the generated variant structs do not inherit enum-level
+// derives, so a payload-carrying variant would not be `Clone`.)
+fast_observe_macros::error! {
+    /// Enum with a user `#[derive(Clone)]` — `Debug` merged alongside.
+    #[derive(Clone)]
+    pub enum CloneError {
+        /// a cloneable failure
+        #[error("clone failure")]
+        Cloned,
+    }
+}
+
+fn needs_debug<T: std::fmt::Debug>(_: &T) {}
+
+#[test]
+// `unwrap_err` on a literal `Err` is deliberate: that call carries the
+// `E: Debug` bound being regression-tested (the README failure mode).
+#[allow(clippy::unnecessary_literal_unwrap, clippy::unwrap_used)]
+fn generated_enum_is_debug_without_user_derive() {
+    let e = PlainError::from(Plain { id: 1 });
+    needs_debug(&e);
+    assert!(format!("{e:?}").contains("Plain"));
+
+    // The exact README failure mode: `unwrap_err` needs `E: Debug`.
+    // (Type annotation: the generated `From<Variant> for Fault<Enum>` and
+    // the blanket `From<E> for Fault<E>` otherwise make E ambiguous.)
+    let fault: Fault<PlainError> = Err::<(), _>(Fault::from(Plain { id: 2 })).unwrap_err();
+    needs_debug(&fault);
+    needs_debug(&*fault);
+}
+
+#[test]
+#[allow(clippy::unnecessary_literal_unwrap, clippy::unwrap_used)]
+fn user_debug_derive_not_duplicated() {
+    // EngineError above carries an explicit `#[derive(Debug)]` — no
+    // conflicting-derive error, and the enum is usable as `Debug`.
+    let e = EngineError::from(EntityNotFound { id: 1 });
+    needs_debug(&e);
+    let fault: Fault<EngineError> =
+        Err::<(), _>(Fault::from(EntityNotFound { id: 1 })).unwrap_err();
+    needs_debug(&*fault);
+}
+
+#[test]
+fn other_user_derives_preserved_and_debug_still_added() {
+    let e = CloneError::Cloned;
+    needs_debug(&e);
+    // The user's `Clone` still applies.
+    let cloned = e.clone();
+    assert_eq!(cloned.to_string(), "clone failure");
+}

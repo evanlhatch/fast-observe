@@ -79,6 +79,10 @@ macro_rules! profiling_backend {
         $(, on_enable = $on_enable:ident)?
         $(,)?
     ) => {
+        // `pub` (not `pub(crate)`) is load-bearing for macro hygiene:
+        // `finish_frame!` expands to `$crate::profiling::<wrap>::…` in
+        // CONSUMER crates. Pure implementation detail — hidden from docs.
+        #[doc(hidden)]
         pub mod $wrap {
             #[cfg $enabled]
             pub use super::$backend::{dummy, enter, $($finish_frame,)? $($on_enable,)? $guard};

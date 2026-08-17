@@ -53,7 +53,7 @@ fn error_category_display_matches_name() {
 
 // ── Fault construction + context ──────────────────────────────────────
 
-// A concrete error type — Fault's typed API (frame/context/with_context)
+// A concrete error type — Fault's typed API (frame/context/set_context)
 // requires E: Error, which Box<dyn Error> does not satisfy here.
 #[derive(Debug)]
 struct TestErr;
@@ -71,8 +71,8 @@ fn fault_from_str_displays_message() {
 }
 
 #[test]
-fn fault_with_context_shows_in_display() {
-    let f = Fault::new(TestErr).with_context(Context::tick(42));
+fn fault_set_context_shows_in_display() {
+    let f = Fault::new(TestErr).set_context(Context::tick(42));
     let s = f.to_string();
     assert!(s.contains("boom"), "missing error: {s}");
     assert!(s.contains("tick 42"), "missing context: {s}");
@@ -88,16 +88,49 @@ fn fault_frame_records_type_and_location() {
 }
 
 #[test]
-fn result_ext_wrap_msg_preserves_cause() {
+fn result_ext_context_preserves_cause() {
     let inner: core::result::Result<(), std::io::Error> = Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         "missing file",
     ));
-    let err = inner.wrap_msg("loading spec").unwrap_err();
+    let err = inner.context("loading spec").unwrap_err();
     let s = err.to_string();
     assert!(s.contains("loading spec"), "missing wrapper msg: {s}");
     // The cause is a child frame in the causal tree — visible in Debug.
     let dbg = format!("{err:?}");
+    assert!(dbg.contains("missing file"), "missing cause in tree: {dbg}");
+}
+
+#[test]
+fn result_ext_with_context_lazy_only_on_err() {
+    let flag = Cell::new(false);
+
+    // Ok: the closure must not run.
+    let ok: core::result::Result<u32, std::io::Error> = Ok(7);
+    let v = ok
+        .with_context(|| {
+            flag.set(true);
+            "unused".into()
+        })
+        .unwrap();
+    assert_eq!(v, 7);
+    assert!(!flag.get(), "closure must not run on Ok");
+
+    // Err: the closure runs, its message wraps the error.
+    let err: core::result::Result<u32, std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "missing file",
+    ));
+    let e = err
+        .with_context(|| {
+            flag.set(true);
+            "loading spec".into()
+        })
+        .unwrap_err();
+    assert!(flag.get(), "closure runs on Err");
+    let s = e.to_string();
+    assert!(s.contains("loading spec"), "missing wrapper msg: {s}");
+    let dbg = format!("{e:?}");
     assert!(dbg.contains("missing file"), "missing cause in tree: {dbg}");
 }
 
@@ -183,9 +216,9 @@ fn debug_tree_uses_continuation_prefixes_for_nested_children() {
 }
 
 #[test]
-fn wrap_msg_preserves_nested_source_chain() {
+fn context_preserves_nested_source_chain() {
     let inner: core::result::Result<(), ChainErr> = Err(chain(&["mid", "leaf"]));
-    let err = inner.wrap_msg("wrapping").unwrap_err();
+    let err = inner.context("wrapping").unwrap_err();
     let dbg = format!("{err:?}");
     assert!(dbg.contains("wrapping"), "wrapper message: {dbg}");
     // The original error's source chain survives, nested (was: dropped).

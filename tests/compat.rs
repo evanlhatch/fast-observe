@@ -23,7 +23,7 @@ mod anyhow_tests {
 
     #[test]
     fn fault_to_anyhow_keeps_message_and_debug() {
-        // Typed error: `Fault<SimpleError>` has no `Error` impl (BoxError is
+        // Typed error: `Fault<BoxError>` has no `Error` impl (BoxError is
         // unsized), so `into_anyhow` takes a typed `Fault<E>` only.
         let fault = Fault::from(std::io::Error::other("typed failure"));
         let err = into_anyhow(fault);

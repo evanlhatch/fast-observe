@@ -1,26 +1,27 @@
 //! Diagnostic rendering: render-to-String + eprint wrapper + serde roundtrip.
 
+#![feature(error_generic_member_access)]
+
 use fast_observe::diagnostic::{Diagnostic, SourceSpan, eprint_diagnostic, register_source};
-use fast_observe::{Severity, define_errors, render_diagnostic};
+use fast_observe::{Severity, render_diagnostic};
 
 /// Test error enum — registers one code so the registry-note path in
 /// `build_report` is exercised with a live entry (this binary links only
 /// fast-observe, so the registry contents here are exactly what this file
 /// registers).
-#[derive(Debug)]
-pub enum DiagTestError {
-    BadWidget(BadWidget),
-}
-
-define_errors! {
-    enum DiagTestError {
-        (BadWidget, "E777", Content, "bad widget", "bad widget: {name}", {
+fast_observe::error! {
+    /// Errors of the diagnostic test.
+    #[derive(Debug)]
+    pub enum DiagTestError {
+        /// bad widget
+        #[error("bad widget: {name}")]
+        #[code = "E777", category = Content]
+        BadWidget {
+            /// The bad widget's name.
             name: String,
-        });
+        },
     }
 }
-
-impl std::error::Error for DiagTestError {}
 
 #[test]
 fn render_diagnostic_returns_nonempty_string_with_code() {
@@ -131,7 +132,7 @@ fn registry_note_appears_for_known_code() {
     });
     let out = render_diagnostic(&diag);
     assert!(
-        out.contains("BadWidget [E777] — bad widget (category: Content)"),
+        out.contains("BadWidget [E777] — bad widget: {name} (category: Content)"),
         "missing registry note: {out:?}"
     );
 

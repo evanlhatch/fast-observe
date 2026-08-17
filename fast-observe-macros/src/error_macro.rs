@@ -61,6 +61,17 @@ fn cfg_attrs(attrs: &[Attribute]) -> Vec<&Attribute> {
         .collect()
 }
 
+/// True if `attr` is a `#[derive(...)]` listing `Debug`.
+fn derive_has_debug(attr: &Attribute) -> bool {
+    if !attr_is(attr, "derive") {
+        return false;
+    }
+    matches!(&attr.value, AttributeValue::Group(_, tokens)
+        if tokens
+            .iter()
+            .any(|tt| matches!(tt, TokenTree::Ident(ident) if ident == "Debug")))
+}
+
 /// Strip quotes off a plain `"..."` literal (raw strings / escapes: None).
 fn unquote(lit: &Literal) -> Option<String> {
     lit.to_string()
@@ -388,7 +399,12 @@ fn emit_enum(en: &Enum, enum_attrs: &[Attribute], variants: &[Variant]) -> Token
             }
         }
     });
+    // `impl Error` requires `Debug`: add the derive unless the user's own
+    // `#[derive(...)]` already lists `Debug` (merging avoided — a second
+    // derive attribute composes fine, a duplicate `Debug` does not).
+    let debug_derive = (!enum_attrs.iter().any(derive_has_debug)).then(|| quote!(#[derive(Debug)]));
     quote! {
+        #debug_derive
         #(#enum_attrs)*
         #vis enum #name {
             #( #defs, )*
@@ -455,9 +471,14 @@ fn codegen(
                 } else {
                     None
                 };
+                // Same double-derive guard as the enum: a user `#[derive]`
+                // on the variant is forwarded here, so skip ours if it
+                // already lists `Debug`.
+                let debug_derive =
+                    (!attrs.iter().any(derive_has_debug)).then(|| quote!(#[derive(Debug)]));
                 out.extend(quote! {
                     #(#attrs)*
-                    #[derive(Debug)]
+                    #debug_derive
                     #vis struct #vname {
                         #( #field_defs, )*
                     }

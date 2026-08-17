@@ -50,6 +50,8 @@
 
 use std::time::Duration;
 
+use sealed::sealed;
+
 use crate::config::{Backends, config};
 use crate::profiling::instant::{self, SpanRecord};
 
@@ -187,6 +189,7 @@ impl Drop for Restore {
 /// Concurrency caveat: the backend mask is process-global while span storage
 /// is thread-local. Concurrent callers (parallel tests) can restore the mask
 /// under each other and silently stop span recording — serialize callers.
+#[must_use]
 pub fn measure_breakdown(iterations: usize, mut f: impl FnMut()) -> ProfiledRun {
     let cfg = config();
     let saved = cfg.backends();
@@ -208,6 +211,11 @@ pub fn measure_breakdown(iterations: usize, mut f: impl FnMut()) -> ProfiledRun 
 }
 
 /// Extension methods for [`divan::Bencher`].
+///
+/// Sealed: the only implementation is for [`divan::Bencher`] — the method
+/// consumes the `Bencher` and drives divan's sample loop, so user
+/// implementations are not supported.
+#[sealed]
 pub trait BenchExt {
     /// Like [`divan::Bencher::bench_local`], but with the instant span
     /// accumulator enabled for the closure's duration; returns the aggregated
@@ -232,6 +240,7 @@ pub trait BenchExt {
     fn bench_profiled<T>(self, f: impl FnMut() -> T) -> ProfiledRun;
 }
 
+impl __seal_bench_ext::Sealed for divan::Bencher<'_, '_> {}
 impl BenchExt for divan::Bencher<'_, '_> {
     fn bench_profiled<T>(self, f: impl FnMut() -> T) -> ProfiledRun {
         let cfg = config();

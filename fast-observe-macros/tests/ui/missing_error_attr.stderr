@@ -1,0 +1,5 @@
+error: variant `Bare` is missing `#[error("...")]` — the Display template is required on every variant
+  --> tests/ui/missing_error_attr.rs:12:9
+   |
+12 |         Bare,
+   |         ^^^^
