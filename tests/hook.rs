@@ -308,3 +308,36 @@ fn scope_path_attached_when_scoped() {
         "built-in scope hook must attach scope_path when a scope is active"
     );
 }
+
+// ── Backtrace capture hook (feature `backtrace`) ──────────────────────────
+
+#[cfg(feature = "backtrace")]
+unique_error!(BacktraceMarkerError, "backtrace marker");
+
+#[cfg(feature = "backtrace")]
+#[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
+fn backtrace_attachment_when_env_set() {
+    let _serial = TEST_LOCK.lock().unwrap();
+
+    // The env decision (RUST_BACKTRACE / OBSERVE_BACKTRACE) is resolved once
+    // in a LazyLock at first use — process-global and possibly already
+    // initialized by an earlier test thread, so env manipulation here would
+    // be racy (and `set_var` is unsafe on edition 2024). The full decision
+    // matrix is unit-tested against the pure `backtrace_enabled` fn in
+    // src/hook.rs. This integration test asserts only deterministic
+    // properties: construction must not panic, and any `backtrace`
+    // attachment must be Appendix-placed (counted, not inlined by the
+    // report).
+    let f = Fault::new(BacktraceMarkerError);
+    assert!(f.to_string().contains("backtrace marker"));
+    for attachment in f.frame().attachments() {
+        if attachment.key() == Some("backtrace") {
+            assert_eq!(
+                attachment.placement(),
+                fast_observe::Placement::Appendix,
+                "backtrace attachment must be Appendix (counted, not inlined)"
+            );
+        }
+    }
+}

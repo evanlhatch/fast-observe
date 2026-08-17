@@ -6,6 +6,10 @@
 //! in; the [`Backends`] mask selects which compiled backends are live at
 //! runtime.
 //!
+//! Env split: log-level envs (`OBSERVE_LOG` → `RUST_LOG`) and
+//! `OBSERVE_LOG_DIR` are consumed by `crate::deploy`; this module owns
+//! `OBSERVE_PROFILE` and `OBSERVE_ERROR_THROTTLE`.
+//!
 //! The environment variable `OBSERVE_PROFILE` overrides the backend set at
 //! startup (first `config()` access). It is a comma-separated,
 //! case-insensitive list:
@@ -20,6 +24,10 @@
 //!
 //! Setting a bit whose feature is not compiled in logs a one-time warning
 //! naming the exact cargo feature to enable.
+//!
+//! The environment variable `OBSERVE_ERROR_THROTTLE` (a `u32`) sets the
+//! error-hook throttle at startup — max hook invocations per error type per
+//! second. Unparseable values warn and keep the default (`0` = unlimited).
 //!
 //! ```ignore
 //! use fast_observe::config::{Backends, config};
@@ -241,11 +249,20 @@ static CONFIG: LazyLock<ObserveConfig> = LazyLock::new(|| {
             ),
         }
     }
+    if let Ok(value) = std::env::var("OBSERVE_ERROR_THROTTLE") {
+        match value.trim().parse::<u32>() {
+            Ok(n) => cfg.set_error_hook_throttle(n),
+            Err(_) => log::warn!(
+                target: "fast_observe.config",
+                "invalid OBSERVE_ERROR_THROTTLE={value:?}; expected a u32 — keeping default (0 = unlimited)"
+            ),
+        }
+    }
     cfg
 });
 
-/// Access the global runtime config. The `OBSERVE_PROFILE` env override is
-/// applied once, on first access.
+/// Access the global runtime config. The `OBSERVE_PROFILE` and
+/// `OBSERVE_ERROR_THROTTLE` env overrides are applied once, on first access.
 #[must_use]
 pub fn config() -> &'static ObserveConfig {
     &CONFIG

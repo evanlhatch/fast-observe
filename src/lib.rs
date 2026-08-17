@@ -5,6 +5,8 @@
 #![feature(error_generic_member_access)]
 #![doc = include_str!("../README.md")]
 
+#[cfg(feature = "bench")]
+pub mod bench;
 #[cfg(feature = "instant")]
 pub mod breakdown;
 pub mod compat;
@@ -109,6 +111,19 @@ impl Policy {
 }
 
 pub use ErrorCategory as Category;
+
+/// One-import surface: the canonical vocabulary (OBSERVE.md §5b).
+/// `Result` here is `fast_observe::Result` — the anyhow-style default.
+pub mod prelude {
+    pub use crate::config::{Backends, config};
+    pub use crate::{
+        Attachment, BoxError, Category, Coded, Context, ErrorCategory, ErrorExt, Fault,
+        FaultCollection, Frame, InternalError, OptionExt, Placement, Policy, Result, ResultExt,
+        SimpleError, add_capture_hook, add_error_hook, all_functions, bail, define_errors, doctor,
+        ensure, error, error_counts, error_registry, finish_frame, init, instrument, lookup_error,
+        observe, render_report, report_display, scope, skip,
+    };
+}
 
 // ── Macro support internals (not public API) ──────────────────────────────
 

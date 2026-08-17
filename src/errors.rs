@@ -1,6 +1,10 @@
 //! Crate-agnostic error machinery: the `define_errors!` macro,
 //! `ErrorRegistryEntry`, and the global `ERROR_REGISTRY`.
 //!
+//! DEPRECATED PATH: `define_errors!` is superseded by the `error!` proc
+//! macro; it remains supported through 0.x — new code should use
+//! `fast_observe::error!`.
+//!
 //! The registry is a `linkme` distributed slice — a `define_errors!`
 //! invocation in ANY crate registers its variants here at link time, so your
 //! app's doctor/CLI (e.g. `myapp doctor <code>`) looks up errors
@@ -111,6 +115,10 @@ pub fn doctor(code: &str) -> Option<String> {
     Some(out)
 }
 
+/// DEPRECATED PATH: superseded by the `error!` proc macro (thiserror-style
+/// attributes, advice, provide(), constructors). define_errors! remains
+/// supported through 0.x; new code should use `fast_observe::error!`.
+///
 /// Generates error variant structs + per-struct Display/Error + ENTRY
 /// consts + `From<Variant> for Enum` + link-time `ERROR_REGISTRY`
 /// registration + the enum's `code()` / `category()` / `Display` from a

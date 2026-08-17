@@ -14,9 +14,43 @@
 //!
 //! The `scope!` / `#[all_functions]` API is compatible with upstream
 //! `profiling`.
+//!
+//! # Async
+//!
+//! [`scope!`] guards are thread-bound (`!Send`-adjacent: they enter/exit
+//! thread-local span stacks), so **never hold one across `.await`** — the
+//! guard would record against whatever thread the task is next polled on.
+//! Sync scopes *between* awaits are fine. `#[instrument]` is sync-only for
+//! the same reason: applying it to an `async fn` is a compile error.
+//!
+//! For async code (feature `fastrace`):
+//!
+//! - bind [`root_span!`] once per task/request to establish the trace
+//!   context (optionally continuing an incoming one), then
+//! - wrap the future with
+//!   [`profiling::async_::in_observed_span`](async_::in_observed_span) /
+//!   [`ObservedFutureExt`](async_::ObservedFutureExt) — the span is entered
+//!   on every poll and follows the task across threads, and
+//! - for `Stream`s, use the `fastrace_futures` re-export
+//!   ([`async_::futures`](async_::futures)) under feature `int-futures`.
+//!
+//! # Example
+//!
+//! ```no_run
+//! # #[cfg(feature = "fastrace")] {
+//! use fast_observe::profiling::async_::ObservedFutureExt;
+//!
+//! let _root = fast_observe::root_span!("request");
+//! # let work = async {};
+//! let task = work.in_observed_span("load");
+//! # drop(task);
+//! # }
+//! ```
 
 // ── Backend modules ────────────────────────────────────────────────────────
 
+#[cfg(feature = "fastrace")]
+pub mod async_;
 pub(crate) mod clock;
 #[cfg(feature = "fastrace")]
 pub(crate) mod fastrace;
@@ -218,6 +252,31 @@ macro_rules! scope {
     ($name:expr, $tag:expr) => {{
         let _guard = $crate::profiling::ScopeGuard::new_static($name, Some($tag.as_ref()));
         _guard
+    }};
+}
+
+/// Start (or continue) a fastrace trace and install it as the thread-local
+/// parent. Async-correct per task: bind the guard before the first `.await`
+/// and keep it alive for the task's whole lifetime.
+///
+/// ```ignore
+/// root_span!("request")        // new trace (random SpanContext)
+/// root_span!("request", ctx)   // continue an incoming trace (SpanContext)
+/// ```
+///
+/// Both forms bind `let _root = …;` and evaluate to the
+/// [`LocalParentGuard`](fastrace::local::LocalParentGuard). Only available
+/// with feature `fastrace`.
+#[cfg(feature = "fastrace")]
+#[macro_export]
+macro_rules! root_span {
+    ($name:expr) => {{
+        let _root = $crate::profiling::async_::root_span($name);
+        _root
+    }};
+    ($name:expr, $ctx:expr) => {{
+        let _root = $crate::profiling::async_::root_span_with($name, $ctx);
+        _root
     }};
 }
 

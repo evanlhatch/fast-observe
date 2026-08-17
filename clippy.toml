@@ -1,0 +1,6 @@
+# The crate clock facade is mandatory: std time panics on wasm32 and
+# bypasses the fastant/web-time split. Use crate::profiling::clock.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "use crate::profiling::clock (fastant/web-time split); std Instant panics on wasm32-unknown-unknown" },
+    { path = "std::time::SystemTime::now", reason = "wall-clock never appears in observability output; use crate::profiling::clock for elapsed" },
+]

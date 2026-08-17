@@ -104,3 +104,97 @@ fn leaf_elapsed_is_sane() {
         "elapsed {elapsed:?} must be Some(>= 1ms) after 2ms sleep"
     );
 }
+
+// ── Async tracing surface (DESIGN.md §2 async gap) ────────────────────────
+
+#[cfg(feature = "fastrace")]
+mod async_tracing {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll};
+
+    use fast_observe::profiling::async_::{
+        ObservedFutureExt, extract_traceparent, in_observed_span, inject_traceparent,
+    };
+    use fastrace::collector::{SpanContext, SpanId, TraceId};
+
+    /// Minimal executor: poll the future on this thread with the std noop
+    /// waker until ready.
+    fn block_on<F: Future>(f: F) -> F::Output {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut f = pin!(f);
+        loop {
+            match f.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Current local parent, with a loud failure when absent (feature-gated
+    /// fastrace must be built with its `enable` feature for these tests to
+    /// observe anything).
+    fn local_parent() -> SpanContext {
+        let parent = SpanContext::current_local_parent();
+        assert!(parent.is_some(), "expected an active local parent");
+        parent.unwrap_or_else(SpanContext::random)
+    }
+
+    #[test]
+    fn root_span_creates_local_parent() {
+        assert!(
+            SpanContext::current_local_parent().is_none(),
+            "no local parent before root_span!"
+        );
+        {
+            let _root = fast_observe::root_span!("request");
+            let _ = local_parent();
+        }
+        assert!(
+            SpanContext::current_local_parent().is_none(),
+            "guard drop must clear the local parent"
+        );
+    }
+
+    #[test]
+    fn root_span_continues_context() {
+        let ctx = {
+            let _root = fast_observe::root_span!("a");
+            local_parent()
+        };
+        let _root = fast_observe::root_span!("b", ctx);
+        assert_eq!(
+            local_parent().trace_id,
+            ctx.trace_id,
+            "continuation form must keep the incoming trace id"
+        );
+    }
+
+    #[test]
+    fn in_observed_span_smoke() {
+        let _root = fast_observe::root_span!("task");
+        let out = block_on(
+            in_observed_span("load", async {
+                // in_span enters the span on poll, so the local parent is
+                // active inside the future body.
+                let _ = local_parent();
+                42
+            })
+            .in_observed_span("outer"),
+        );
+        assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn traceparent_roundtrip() {
+        // NB: SpanContext::random() has span_id == 0, which the W3C codec
+        // rejects as invalid — build a context with a nonzero span id.
+        let ctx = SpanContext::new(TraceId::random(), SpanId::random());
+        let header = inject_traceparent(&ctx);
+        let back = extract_traceparent(&header);
+        assert!(back.is_some(), "roundtrip header must decode: {header}");
+        assert_eq!(back.map(|c| c.trace_id), Some(ctx.trace_id));
+        assert!(extract_traceparent("not-a-traceparent").is_none());
+    }
+}

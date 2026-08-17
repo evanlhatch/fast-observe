@@ -107,8 +107,8 @@ type CaptureHook = Arc<dyn Fn(&mut Frame) + Send + Sync + 'static>;
 
 // Same snapshot-Arc pattern as `HOOKS`. INVARIANT: the initial vec always
 // holds the built-in capture hooks (trace context under feature `fastrace`,
-// then scope path), so they run for every frame without setup;
-// `add_capture_hook` only appends.
+// then scope path, then backtrace under feature `backtrace`), so they run
+// for every frame without setup; `add_capture_hook` only appends.
 static CAPTURE_HOOKS: OnceLock<Mutex<Arc<Vec<CaptureHook>>>> = OnceLock::new();
 
 fn capture_hooks() -> &'static Mutex<Arc<Vec<CaptureHook>>> {
@@ -117,6 +117,8 @@ fn capture_hooks() -> &'static Mutex<Arc<Vec<CaptureHook>>> {
             #[cfg(feature = "fastrace")]
             trace_context_capture_hook(),
             scope_path_capture_hook(),
+            #[cfg(feature = "backtrace")]
+            backtrace_capture_hook(),
         ];
         Mutex::new(Arc::new(built_ins))
     })
@@ -163,6 +165,70 @@ fn scope_path_capture_hook() -> CaptureHook {
         if let Some(ms) = crate::profiling::current_scope_elapsed_ms() {
             frame.push_attachment(Attachment::with_key("scope_elapsed_ms", ms));
         }
+    })
+}
+
+// ── Backtrace capture hook (feature `backtrace`) ─────────────────────────
+
+/// Env decision for backtrace capture, factored pure for testing: capture
+/// when `RUST_BACKTRACE` is `1`/`full`, or when `OBSERVE_BACKTRACE` is set
+/// to a truthy value (`1`/`true`/`full`). `OBSERVE_BACKTRACE`, when set,
+/// overrides `RUST_BACKTRACE` in both directions (a falsy override disables
+/// capture even with `RUST_BACKTRACE=1`). `read` abstracts `std::env::var`
+/// so the matrix is unit-testable without mutating process env (unsafe on
+/// edition 2024).
+#[cfg(feature = "backtrace")]
+fn backtrace_enabled(read: impl Fn(&str) -> Option<String>) -> bool {
+    if let Some(override_value) = read("OBSERVE_BACKTRACE") {
+        return matches!(
+            override_value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "full"
+        );
+    }
+    match read("RUST_BACKTRACE") {
+        Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "full"),
+        None => false,
+    }
+}
+
+/// Resolved once — a process does not toggle `RUST_BACKTRACE` mid-flight in
+/// practice, and resolving once keeps the hot path a single shared load.
+#[cfg(feature = "backtrace")]
+static BACKTRACE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| backtrace_enabled(|name| std::env::var(name).ok()));
+
+/// Backtrace attachment value — `Display` delegates to the captured
+/// backtrace's own `Display`.
+#[cfg(feature = "backtrace")]
+struct BacktraceAttachment(std::backtrace::Backtrace);
+
+#[cfg(feature = "backtrace")]
+impl std::fmt::Display for BacktraceAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Built-in capture hook (feature `backtrace`): attach a forced backtrace
+/// under the `backtrace` key with [`Placement::Appendix`] — the report
+/// renders only Inline attachments, so the backtrace is counted, not
+/// inlined. Zero cost when the env knob is off: the resolved flag is
+/// checked before any capture happens.
+///
+/// [`Placement::Appendix`]: crate::exn::Placement::Appendix
+#[cfg(feature = "backtrace")]
+fn backtrace_capture_hook() -> CaptureHook {
+    Arc::new(|frame: &mut Frame| {
+        if !*BACKTRACE_ENABLED {
+            return;
+        }
+        frame.push_attachment(
+            Attachment::with_key(
+                "backtrace",
+                BacktraceAttachment(std::backtrace::Backtrace::force_capture()),
+            )
+            .with_placement(crate::exn::Placement::Appendix),
+        );
     })
 }
 
@@ -280,6 +346,48 @@ pub fn init() {
     // Dropping an Ok guard flushes fastrace immediately — harmless at init
     // (no spans collected yet) and keeps this path allocation-free.
     drop(crate::deploy::observe().init());
+}
+
+#[cfg(all(test, feature = "backtrace"))]
+mod tests {
+    use super::backtrace_enabled;
+
+    /// Fake env for the pure `backtrace_enabled` decision.
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn backtrace_enabled_matrix() {
+        // Neither set → off.
+        assert!(!backtrace_enabled(env(&[])));
+        // RUST_BACKTRACE: only 1/full count (0 does not).
+        assert!(!backtrace_enabled(env(&[("RUST_BACKTRACE", "0")])));
+        assert!(backtrace_enabled(env(&[("RUST_BACKTRACE", "1")])));
+        assert!(backtrace_enabled(env(&[("RUST_BACKTRACE", "full")])));
+        assert!(!backtrace_enabled(env(&[("RUST_BACKTRACE", "yes")])));
+        // OBSERVE_BACKTRACE alone: truthy values 1/true/full (case-insensitive).
+        assert!(backtrace_enabled(env(&[("OBSERVE_BACKTRACE", "1")])));
+        assert!(backtrace_enabled(env(&[("OBSERVE_BACKTRACE", "true")])));
+        assert!(backtrace_enabled(env(&[("OBSERVE_BACKTRACE", "full")])));
+        assert!(backtrace_enabled(env(&[("OBSERVE_BACKTRACE", "TRUE")])));
+        assert!(!backtrace_enabled(env(&[("OBSERVE_BACKTRACE", "0")])));
+        assert!(!backtrace_enabled(env(&[("OBSERVE_BACKTRACE", "no")])));
+        // OBSERVE_BACKTRACE overrides RUST_BACKTRACE in both directions.
+        assert!(!backtrace_enabled(env(&[
+            ("RUST_BACKTRACE", "1"),
+            ("OBSERVE_BACKTRACE", "0"),
+        ])));
+        assert!(backtrace_enabled(env(&[
+            ("RUST_BACKTRACE", "0"),
+            ("OBSERVE_BACKTRACE", "1"),
+        ])));
+    }
 }
 
 /// Install an `OpenTelemetry` reporter for fastrace (feature `otel`).

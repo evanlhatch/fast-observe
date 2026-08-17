@@ -5,7 +5,6 @@ members = ["fast-observe-macros"]
 name = "fast-observe"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
 authors = ["evan"]
 license = "MIT OR Apache-2.0"
 description = "Error faults with causal trees + fastrace-first profiling/log orchestration"
@@ -19,8 +18,13 @@ default = ["fastrace", "bridge-log"]
 # Thread-local Instant span accumulator + timing breakdown (wasm-safe via web-time).
 instant = ["dep:humantime", "dep:nu-ansi-term"]
 # fastrace spans + logforth fastrace event appender + fastrace trace diagnostic.
+# NOTE: forwards `fastrace/enable` — fast-observe is the app-facing
+# deployment crate; without `enable` every fastrace span silently no-ops.
+# Libraries depending on fast-observe: use `default-features = false` and
+# let the binary enable fastrace (fastrace's library-level-tracing rule).
 fastrace = [
     "dep:fastrace",
+    "fastrace/enable",
     "dep:logforth-append-fastrace",
     "dep:logforth-diagnostic-fastrace",
 ]
@@ -51,6 +55,14 @@ profile-with-tracing = ["dep:tracing"]
 profile-with-superluminal = ["dep:superluminal-perf"]
 # serde Serialize/Deserialize for Diagnostic, Severity, SourceSpan.
 serde = ["dep:serde", "camino/serde1"]
+# fastrace-futures re-export (Stream tracing; FutureExt is in fastrace core).
+int-futures = ["fastrace", "dep:fastrace-futures"]
+# Backtrace capture hook (std::backtrace; honors RUST_BACKTRACE).
+backtrace = []
+# best-effort fastrace flush on process exit (atexit/SIGTERM).
+flush-on-exit = ["fastrace", "dep:libc"]
+# divan re-export + span-breakdown benchmarking (bench_profiled).
+bench = ["instant", "dep:divan"]
 # Explicit anyhow ↔ Fault boundary conversions (never implicit From).
 anyhow-boundary = ["dep:anyhow"]
 
@@ -84,6 +96,9 @@ puffin = { version = "0.20", optional = true }
 tracy-client = { version = "0.18", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
+fastrace-futures = { version = "0.7", optional = true }
+divan = { version = "0.1", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

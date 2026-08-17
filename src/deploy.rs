@@ -26,6 +26,10 @@ use bon::Builder;
 /// The observability deployment. Build via [`observe()`]; every capability
 /// is one toggle with a documented default. Compiled-in ≠ active.
 #[derive(Builder)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "builder toggles — each bool is an independent documented capability"
+)]
 pub struct Deployment {
     /// Max log level. Default: `OBSERVE_LOG` → `RUST_LOG` → `Info`.
     level: Option<log::LevelFilter>,
@@ -54,6 +58,20 @@ pub struct Deployment {
     /// [`TracesChoice::Console`].
     #[builder(default)]
     traces: TracesChoice,
+    /// Panic hook: log panics as structured error events through the log
+    /// pipeline, then chain to the previously installed hook (DESIGN.md
+    /// §9b.3). Default: `true`. Chaining means a
+    /// `console_error_panic_hook` set by a wasm app (or the cargo test
+    /// harness hook) still runs after our log — the prior hook is never
+    /// stomped.
+    #[builder(default = true)]
+    panic_hook: bool,
+    /// Best-effort fastrace flush on process exit via `libc::atexit` +
+    /// SIGTERM/SIGHUP handlers (feature `flush-on-exit`, native targets
+    /// only — DESIGN.md §9b.4). Default: `true`. The field is always
+    /// present; without the feature (or on wasm) it is a documented no-op.
+    #[builder(default = true)]
+    flush_on_exit: bool,
 }
 
 /// Stdout layout selector for [`Deployment::layout`].
@@ -117,6 +135,8 @@ impl Deployment {
             backends,
             error_hook_throttle,
             traces,
+            panic_hook,
+            flush_on_exit,
         } = self;
 
         // Fields consumed only under their cargo feature — mark them read in
@@ -125,6 +145,8 @@ impl Deployment {
         let _ = file_from_env;
         #[cfg(not(feature = "fastrace"))]
         let _ = traces;
+        #[cfg(not(all(feature = "flush-on-exit", not(target_family = "wasm"))))]
+        let _ = flush_on_exit;
 
         // 1. Runtime config toggles (applied even if logger init fails).
         if let Some(backends) = backends {
@@ -210,7 +232,116 @@ impl Deployment {
             );
         }
 
+        // 7. Panic hook — after the logger is live, so panic logs have
+        // somewhere to go.
+        if panic_hook {
+            install_panic_hook();
+        }
+
+        // 8. Best-effort flush on process exit (feature `flush-on-exit`) —
+        // after the reporter exists, so the flush has somewhere to send
+        // spans.
+        #[cfg(all(feature = "flush-on-exit", not(target_family = "wasm")))]
+        if flush_on_exit {
+            install_exit_flush();
+        }
+
         Ok(InitGuard { _private: () })
+    }
+}
+
+/// Install a panic hook that logs the panic as a structured error event
+/// THROUGH the log pipeline (target `fast_observe.panic`, kv fields
+/// `panic_file`/`panic_line`, message = the panic payload string), then
+/// CHAINS to the previously installed hook — composability: never stomp.
+///
+/// Category mapping: a panic is an unrecovered bug surfaced at runtime,
+/// conceptually [`ErrorCategory::Fatal`](crate::ErrorCategory::Fatal)
+/// events; logging them as structured errors makes a panic and a returned
+/// error indistinguishable in a crash log (DESIGN.md §9b.3).
+///
+/// Chaining is `take_hook` + `set_hook`, not `std::panic::update_hook`:
+/// `update_hook` is still unstable (feature `panic_update_hook`,
+/// [rust#92649]) and this crate only enables
+/// `error_generic_member_access`. The pair is not atomic — a concurrent
+/// `set_hook` between them would be lost; `init()` runs at startup, before
+/// user hooks, so this is acceptable. On wasm the chaining preserves a
+/// `console_error_panic_hook` the app may have set — it runs after our
+/// log, unchanged.
+///
+/// [rust#92649]: https://github.com/rust-lang/rust/issues/92649
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string payload>");
+        match info.location() {
+            Some(location) => log::error!(
+                target: "fast_observe.panic",
+                panic_file = location.file(),
+                panic_line = location.line();
+                "panic: {payload}"
+            ),
+            None => log::error!(target: "fast_observe.panic", "panic: {payload}"),
+        }
+        // Chain — never stomp the previous hook (the cargo test harness
+        // hook, a wasm `console_error_panic_hook`, …).
+        previous(info);
+    }));
+}
+
+/// `extern "C"` trampoline invoked by `atexit` and the SIGTERM/SIGHUP
+/// handlers: flush fastrace best-effort. Registered with `libc::atexit`
+/// (normal exit) and `libc::signal` (SIGTERM/SIGHUP — servers die by
+/// signal, not by Drop, so [`InitGuard`]'s drop flush never runs there).
+/// The signal path is technically NOT async-signal-safe (`fastrace::flush`
+/// allocates) and may misbehave if a signal lands mid-allocation; accepted
+/// as a best-effort flush, documented in DESIGN.md §9b.4.
+#[cfg(all(feature = "flush-on-exit", not(target_family = "wasm")))]
+extern "C" fn fastrace_flush_trampoline() {
+    fastrace::flush();
+}
+
+/// Register [`fastrace_flush_trampoline`] with `libc::atexit` and as the
+/// SIGTERM/SIGHUP handler. Best-effort: a failed `atexit` registration
+/// only logs a warning.
+///
+/// # Safety
+/// `libc::atexit`/`libc::signal` are FFI calls with a C contract: `atexit`
+/// takes an `extern "C" fn()` callback and `signal` takes the handler as a
+/// `sighandler_t` (a `usize` alias). `fastrace_flush_trampoline` is
+/// `extern "C" fn()` — matching the `atexit` contract exactly, and matching
+/// the C signal-handler ABI on all supported targets (the caller passes one
+/// `c_int` argument, which a zero-argument `extern "C"` callee safely
+/// ignores).
+#[cfg(all(feature = "flush-on-exit", not(target_family = "wasm")))]
+#[allow(
+    unsafe_code,
+    function_casts_as_integer,
+    reason = "libc::atexit/libc::signal FFI contract: sighandler_t is a usize alias"
+)]
+fn install_exit_flush() {
+    // SAFETY: see the fn-level Safety section — the trampoline matches the
+    // C ABI contract of both registration points.
+    unsafe {
+        if libc::atexit(fastrace_flush_trampoline) != 0 {
+            log::warn!(
+                target: "fast_observe.deploy",
+                "libc::atexit registration failed — exit flush will not run on normal exit"
+            );
+        }
+        libc::signal(
+            libc::SIGTERM,
+            fastrace_flush_trampoline as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            fastrace_flush_trampoline as libc::sighandler_t,
+        );
     }
 }
 
@@ -301,6 +432,8 @@ mod tests {
         assert!(d.backends.is_none());
         assert!(d.error_hook_throttle.is_none());
         assert!(matches!(d.traces, TracesChoice::Console));
+        assert!(d.panic_hook);
+        assert!(d.flush_on_exit);
     }
 
     #[test]
@@ -313,6 +446,8 @@ mod tests {
             .backends(crate::config::Backends::OFF)
             .error_hook_throttle(10)
             .traces(TracesChoice::Off)
+            .panic_hook(false)
+            .flush_on_exit(false)
             .build();
         assert_eq!(d.level, Some(log::LevelFilter::Debug));
         assert!(!d.stdout);
@@ -321,6 +456,8 @@ mod tests {
         assert_eq!(d.backends, Some(crate::config::Backends::OFF));
         assert_eq!(d.error_hook_throttle, Some(10));
         assert!(matches!(d.traces, TracesChoice::Off));
+        assert!(!d.panic_hook);
+        assert!(!d.flush_on_exit);
     }
 
     #[test]
