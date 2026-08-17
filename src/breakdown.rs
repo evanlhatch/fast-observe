@@ -38,9 +38,14 @@ fn print_tree(spans: &[SpanRecord]) {
 
     println!("\n  SPAN BREAKDOWN ({} spans):", spans.len());
     let mut sorted: Vec<_> = groups.iter().collect();
-    sorted.sort_by_key(|(_, v)| v.iter().map(Duration::as_nanos).sum::<u128>());
+    sorted.sort_by(|a, b| {
+        b.1.iter()
+            .map(Duration::as_nanos)
+            .sum::<u128>()
+            .cmp(&a.1.iter().map(Duration::as_nanos).sum::<u128>())
+    });
 
-    for (name, durations) in sorted.iter().rev() {
+    for (name, durations) in &sorted {
         let total: u128 = durations.iter().map(Duration::as_nanos).sum();
         let avg = total / durations.len() as u128;
         let color = if avg < 1_000 {

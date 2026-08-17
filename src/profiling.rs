@@ -25,10 +25,10 @@ pub(crate) mod web;
 // ── Wrap modules: feature-gated re-exports + ZST stubs ─────────────────────
 
 macro_rules! profiling_backend {
-    ($wrap:ident, $backend:ident, $guard:ident, feat = $feat:literal) => {
+    ($wrap:ident, $backend:ident, $guard:ident, feat = $feat:literal $(, $finish_frame:ident)?) => {
         pub mod $wrap {
             #[cfg(feature = $feat)]
-            pub use super::$backend::{dummy, enter, $guard};
+            pub use super::$backend::{dummy, enter, $($finish_frame,)? $guard};
             #[cfg(not(feature = $feat))]
             pub struct $guard;
             #[cfg(not(feature = $feat))]
@@ -39,24 +39,10 @@ macro_rules! profiling_backend {
             pub const fn dummy() -> $guard {
                 $guard
             }
-        }
-    };
-    ($wrap:ident, $backend:ident, $guard:ident, feat = $feat:literal, finish_frame) => {
-        pub mod $wrap {
-            #[cfg(feature = $feat)]
-            pub use super::$backend::{dummy, enter, finish_frame, $guard};
+            $(
             #[cfg(not(feature = $feat))]
-            pub struct $guard;
-            #[cfg(not(feature = $feat))]
-            pub const fn enter<'a>(_name: &'a str, _tag: Option<&'a str>) -> $guard {
-                $guard
-            }
-            #[cfg(not(feature = $feat))]
-            pub const fn dummy() -> $guard {
-                $guard
-            }
-            #[cfg(not(feature = $feat))]
-            pub const fn finish_frame() {}
+            pub const fn $finish_frame() {}
+            )?
         }
     };
 }
@@ -177,7 +163,7 @@ macro_rules! function_scope {
     ($data:expr) => {
         let _func_scope = $crate::profiling::enter_function_scope_with_tag(
             ::std::borrow::Cow::Borrowed($crate::func_path!()),
-            $data.as_ref(),
+            $data,
         );
     };
 }
@@ -220,14 +206,18 @@ pub fn enter_function_scope(name: Cow<'static, str>) -> FunctionScopeGuard {
 }
 
 /// Enter a function scope with a tag. The tag is appended to the scope name.
+/// The tag may be any `impl AsRef<str>` (`&str`, `String`, etc.).
 /// Uses `Cow::Owned` — no leak.
 #[must_use]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "the name is stored in the thread-local — taking by value avoids a double clone at the call site"
 )]
-pub fn enter_function_scope_with_tag(name: Cow<'static, str>, tag: &str) -> FunctionScopeGuard {
-    let full = Cow::Owned(format!("{name}:{tag}"));
+pub fn enter_function_scope_with_tag(
+    name: Cow<'static, str>,
+    tag: impl AsRef<str>,
+) -> FunctionScopeGuard {
+    let full = Cow::Owned(format!("{}:{}", name, tag.as_ref()));
     enter_function_scope(full)
 }
 

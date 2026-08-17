@@ -79,6 +79,7 @@ pub enum Context {
 }
 
 impl Context {
+    #[must_use]
     pub fn scope(name: impl Into<Cow<'static, str>>) -> Self {
         Self::Scope(name.into())
     }
@@ -86,9 +87,11 @@ impl Context {
     pub const fn tick(s: u64) -> Self {
         Self::Tick(s)
     }
+    #[must_use]
     pub fn entity(name: impl Into<Cow<'static, str>>, tick: u64) -> Self {
         Self::Entity(name.into(), tick)
     }
+    #[must_use]
     pub fn custom(msg: impl Into<Cow<'static, str>>) -> Self {
         Self::Custom(msg.into())
     }
@@ -200,7 +203,7 @@ impl Fault<SimpleError> {
 impl From<&str> for Fault<SimpleError> {
     #[track_caller]
     fn from(msg: &str) -> Self {
-        Self::from_boxed(Box::new(InternalError(msg.to_string().into())))
+        Self::from_boxed(internal_err(msg.to_string()))
     }
 }
 
@@ -531,7 +534,7 @@ macro_rules! bail {
 #[macro_export]
 macro_rules! ensure {
     ($cond:expr, $err:expr $(,)?) => {{
-        if !bool::from($cond) {
+        if !($cond) {
             $crate::bail!($err)
         }
     }};
@@ -572,12 +575,14 @@ fn write_fault(f: &mut fmt::Formatter<'_>, frame: &Frame, prefix: &str) -> fmt::
     }
     for (i, child) in frame.children.iter().enumerate() {
         let last = i == frame.children.len() - 1;
-        if last {
+        let next_prefix = if last {
             write!(f, "\n{prefix}`-- ")?;
+            format!("{prefix}    ")
         } else {
             write!(f, "\n{prefix}|-- ")?;
-        }
-        write_fault(f, child, &format!("{prefix}    "))?;
+            format!("{prefix}|   ")
+        };
+        write_fault(f, child, &next_prefix)?;
     }
     Ok(())
 }

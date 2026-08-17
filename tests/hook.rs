@@ -2,10 +2,17 @@
 //! per-type per-second hook throttle.
 
 use fast_observe::exn::Fault;
+use fast_observe::hook::{clear_error_hooks, hooks_len, set_default_hook_enabled};
 use fast_observe::{add_error_hook, config};
 use std::error::Error;
 use std::fmt;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+// Serializes tests that mutate the global throttle config or assert on
+// hook-fire counts: cargo test runs them on parallel threads, so without
+// this they can interleave and flake.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 macro_rules! unique_error {
     ($name:ident, $msg:literal) => {
@@ -25,7 +32,9 @@ macro_rules! unique_error {
 unique_error!(FanoutError, "fanout");
 
 #[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
 fn multiple_hooks_all_fire() {
+    let _serial = TEST_LOCK.lock().unwrap();
     static A: AtomicUsize = AtomicUsize::new(0);
     static B: AtomicUsize = AtomicUsize::new(0);
 
@@ -66,9 +75,12 @@ unique_error!(PanicError, "panic path");
 #[allow(
     clippy::panic,
     clippy::manual_assert,
-    reason = "the test deliberately installs a panicking hook to verify containment"
+    clippy::items_after_statements,
+    clippy::unwrap_used,
+    reason = "the test deliberately installs a panicking hook to verify containment; unwrap is test idiom"
 )]
 fn panicking_hook_is_contained_and_later_hooks_still_run() {
+    let _serial = TEST_LOCK.lock().unwrap();
     static AFTER: AtomicUsize = AtomicUsize::new(0);
 
     add_error_hook(|frame| {
@@ -98,7 +110,9 @@ fn panicking_hook_is_contained_and_later_hooks_still_run() {
 unique_error!(ThrottleError, "throttle me");
 
 #[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
 fn throttle_caps_identical_type_hooks_per_second() {
+    let _serial = TEST_LOCK.lock().unwrap();
     static COUNT: AtomicUsize = AtomicUsize::new(0);
 
     add_error_hook(|frame| {
@@ -126,7 +140,9 @@ fn throttle_caps_identical_type_hooks_per_second() {
 }
 
 #[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
 fn throttle_zero_is_unlimited() {
+    let _serial = TEST_LOCK.lock().unwrap();
     static COUNT: AtomicUsize = AtomicUsize::new(0);
 
     add_error_hook(|frame| {
@@ -150,4 +166,47 @@ fn throttle_zero_is_unlimited() {
     cfg.set_error_hook_throttle(original);
 
     assert_eq!(fired, 4, "throttle 0 = unlimited, got {fired}");
+}
+
+// ── Hook management API ─────────────────────────────────────────────────
+
+#[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
+fn clear_error_hooks_resets_to_default_only() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let before = hooks_len();
+    add_error_hook(|_| {});
+    assert_eq!(
+        hooks_len(),
+        before + 1,
+        "adding a hook grows the count by 1"
+    );
+    clear_error_hooks();
+    assert_eq!(hooks_len(), 1, "clear resets to only the default hook");
+}
+
+unique_error!(DefaultToggleError, "default toggle");
+
+#[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
+fn default_hook_can_be_disabled_and_reenabled() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    add_error_hook(|frame| {
+        if frame.type_name.ends_with("DefaultToggleError") {
+            COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    set_default_hook_enabled(false);
+    let before = COUNT.load(Ordering::Relaxed);
+    let _f = Fault::new(DefaultToggleError);
+    let fired = COUNT.load(Ordering::Relaxed) - before;
+    set_default_hook_enabled(true);
+
+    assert_eq!(
+        fired, 1,
+        "custom hook must still fire while default hook disabled, got {fired}"
+    );
 }

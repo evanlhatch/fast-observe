@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// Profiling backend selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::FromRepr)]
 #[repr(u8)]
 pub enum ProfilingBackend {
     Off = 0,
@@ -70,12 +70,8 @@ impl ObserveConfig {
 
     /// Read the active profiling backend (hot-path, relaxed atomic).
     pub fn profiling_backend(&self) -> ProfilingBackend {
-        match self.profiling_backend.load(Ordering::Relaxed) {
-            0 => ProfilingBackend::Off,
-            1 => ProfilingBackend::Instant,
-            3 => ProfilingBackend::Web,
-            _ => ProfilingBackend::Fastrace,
-        }
+        ProfilingBackend::from_repr(self.profiling_backend.load(Ordering::Relaxed))
+            .unwrap_or(ProfilingBackend::Fastrace)
     }
 
     /// Set the global error-hook throttle: at most `max_per_second` hook

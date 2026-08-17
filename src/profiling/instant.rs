@@ -20,6 +20,20 @@ thread_local! {
     static FINISHED: Cell<Vec<SpanRecord>> = Cell::new(Vec::new());
     static STACK: Cell<Vec<SpanRecord>> = Cell::new(Vec::new());
     static FRAME_BOUNDARIES: Cell<Vec<usize>> = Cell::new(Vec::new());
+    /// Absolute count of spans ever removed from `FINISHED`. Frame
+    /// boundaries are stored absolute; subtract this to rebase.
+    static DRAIN_BASE: Cell<usize> = Cell::new(0);
+}
+
+/// Take/mutate/set dance for a thread-local `Cell<Vec<T>>` — reentrancy
+/// panic-safe: the cell is empty while `f` runs, so nested access sees an
+/// empty vec instead of a `RefCell`-style borrow panic.
+fn with_tl<T>(cell: &'static std::thread::LocalKey<Cell<Vec<T>>>, f: impl FnOnce(&mut Vec<T>)) {
+    cell.with(|c| {
+        let mut v = c.take();
+        f(&mut v);
+        c.set(v);
+    });
 }
 
 /// One recorded span — name, optional tag, start/end (ns since a process
@@ -45,50 +59,60 @@ impl SpanRecord {
 #[must_use]
 pub fn enter(name: &'static str, tag: Option<&'static str>) -> InstantGuard {
     let start_ns = clock::now_ns();
-    STACK.with(|c| {
-        let mut s = c.take();
+    let mut depth = 0;
+    with_tl(&STACK, |s| {
         #[allow(
             clippy::cast_possible_truncation,
             reason = "span nesting depth is bounded well below u32::MAX in practice"
         )]
-        let depth = s.len() as u32;
+        let d = s.len() as u32;
+        depth = d;
         s.push(SpanRecord {
             name,
             tag,
             start_ns,
             end_ns: start_ns,
-            depth,
+            depth: d,
         });
-        c.set(s);
     });
-    InstantGuard
+    InstantGuard { depth: Some(depth) }
 }
 
 /// Guard — records the end timestamp on drop, moves span to `FINISHED`.
-pub struct InstantGuard;
+///
+/// Depth-tagged: the guard remembers its span's stack index at push time.
+/// Drop finalizes every span above that index first (forgotten nested
+/// guards — e.g. via [`std::mem::forget`] — get the same end timestamp,
+/// best-effort), then its own span. Out-of-order or duplicate drops whose
+/// span is already gone are no-ops, so a misbehaving guard can never steal
+/// another scope's span. Guards from [`dummy()`] (`depth: None`) never pop.
+pub struct InstantGuard {
+    depth: Option<u32>,
+}
 
 /// Construct a no-op `InstantGuard` (does nothing on drop).
 #[must_use]
 pub fn dummy() -> InstantGuard {
-    InstantGuard
+    InstantGuard { depth: None }
 }
 
 impl Drop for InstantGuard {
     fn drop(&mut self) {
+        let Some(depth) = self.depth else {
+            return; // dummy guard — no-op.
+        };
         let end_ns = clock::now_ns();
-        STACK.with(|c| {
-            let mut s = c.take();
-            let span = s.pop();
-            c.set(s);
-            if let Some(mut span) = span {
+        let mut done: Vec<SpanRecord> = Vec::new();
+        with_tl(&STACK, |s| {
+            // Finalize forgotten nested spans above ours, then ours. If our
+            // span is already gone (len <= depth) nothing happens.
+            while s.len() > depth as usize {
+                let Some(mut span) = s.pop() else { break };
                 span.end_ns = end_ns;
-                FINISHED.with(|f| {
-                    let mut v = f.take();
-                    v.push(span);
-                    f.set(v);
-                });
+                done.push(span);
             }
         });
+        with_tl(&FINISHED, |f| f.append(&mut done));
     }
 }
 
@@ -96,57 +120,55 @@ impl Drop for InstantGuard {
 /// Automatically drains spans older than the current frame to prevent
 /// unbounded memory growth in thread-local storage.
 pub fn finish_frame() {
-    // Read the finished count without disturbing the buffer.
-    let count = FINISHED.with(|c| {
-        let v = c.take();
-        let n = v.len();
-        c.set(v);
-        n
-    });
+    let base = DRAIN_BASE.with(Cell::get);
+    let mut count = 0;
+    with_tl(&FINISHED, |v| count = v.len());
+    let abs = base + count;
 
-    let mut boundaries = FRAME_BOUNDARIES.with(Cell::take);
-    boundaries.push(count);
-
-    if boundaries.len() > 60 {
-        let keep = boundaries.len() - 60;
-        let cutoff = boundaries[keep];
-        // Drain spans older than the oldest retained frame. The retained
-        // boundary values are absolute indices into FINISHED — after the
-        // drain shrinks the buffer by `cutoff`, shift them down to match.
-        let drained = FINISHED.with(|f| {
-            let mut v = f.take();
-            let drained = if cutoff < v.len() { cutoff } else { 0 };
-            v.drain(0..drained);
-            f.set(v);
-            drained
-        });
-        let mut retained = boundaries[keep..].to_vec();
-        if drained > 0 {
-            for b in &mut retained {
-                *b -= drained;
+    with_tl(&FRAME_BOUNDARIES, |boundaries| {
+        boundaries.push(abs);
+        if boundaries.len() > 60 {
+            let keep = boundaries.len() - 60;
+            let cutoff = boundaries[keep];
+            // Drain spans older than the oldest retained frame. Boundaries
+            // are absolute — no per-element index math, just bump the base.
+            let n = cutoff.saturating_sub(base);
+            if n > 0 {
+                with_tl(&FINISHED, |v| {
+                    v.drain(0..n.min(v.len()));
+                });
             }
+            DRAIN_BASE.with(|b| b.set(b.get().max(cutoff)));
+            boundaries.drain(0..keep);
         }
-        FRAME_BOUNDARIES.with(|b| b.set(retained));
-    } else {
-        FRAME_BOUNDARIES.with(|b| b.set(boundaries));
-    }
+    });
 }
 
-/// Drain all finished spans.
+/// Drain all finished spans. Bumps `DRAIN_BASE` so absolute frame
+/// boundaries stay interpretable (stale ones are filtered on rebase).
 pub fn drain() -> Vec<SpanRecord> {
-    FINISHED.with(Cell::take)
+    let v = FINISHED.with(Cell::take);
+    DRAIN_BASE.with(|b| b.set(b.get() + v.len()));
+    v
 }
 
-/// Drain frame boundaries (for per-tick grouping).
+/// Drain frame boundaries (for per-tick grouping), rebased relative to the
+/// current `FINISHED` buffer; stale boundaries (< `DRAIN_BASE`) dropped.
 #[allow(
     dead_code,
     reason = "public API reserved for per-tick grouping; not used inside the crate"
 )]
 pub fn drain_frames() -> Vec<usize> {
-    FRAME_BOUNDARIES.with(Cell::take)
+    let base = DRAIN_BASE.with(Cell::get);
+    let boundaries = FRAME_BOUNDARIES.with(Cell::take);
+    boundaries
+        .into_iter()
+        .filter(|b| *b >= base)
+        .map(|b| b - base)
+        .collect()
 }
 
-/// Clear everything.
+/// Clear everything, including the drain base.
 #[allow(
     dead_code,
     reason = "test helper + public reset API; not used inside the crate"
@@ -158,6 +180,7 @@ pub fn clear() {
     FRAME_BOUNDARIES.with(|c| {
         c.take();
     });
+    DRAIN_BASE.with(|b| b.set(0));
 }
 
 #[cfg(test)]
@@ -214,6 +237,54 @@ mod tests {
         clear();
         drop(dummy());
         assert!(drain().is_empty());
+    }
+
+    #[test]
+    fn dummy_guard_never_pops() {
+        clear();
+        let real = enter("real", None);
+        drop(dummy()); // must not pop the real span
+        drop(real);
+        let spans = drain();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "real");
+    }
+
+    #[test]
+    fn forgotten_child_is_finalized_not_corrupting() {
+        clear();
+        let a = enter("a", None);
+        let b = enter("b", None);
+        std::mem::forget(b); // leaked guard — b never dropped
+        drop(a); // must finalize b (best-effort) then a
+        let spans = drain();
+        let names: Vec<_> = spans.iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["b", "a"]);
+        for s in &spans {
+            assert!(s.end_ns >= s.start_ns, "end must not precede start");
+        }
+        // Stack is clean — a later scope records at depth 0.
+        drop(enter("c", None));
+        let spans = drain();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "c");
+        assert_eq!(spans[0].depth, 0);
+    }
+
+    #[test]
+    fn boundaries_eviction_caps_at_60() {
+        clear();
+        for _ in 0..70 {
+            drop(enter("x", None));
+            finish_frame();
+        }
+        assert_eq!(drain_frames().len(), 60);
+        // Invariant implemented: eviction keeps the spans covered by the 60
+        // retained boundaries — only spans older than the oldest retained
+        // boundary are drained. Each frame here produced exactly 1 span, so
+        // 70 frames - 61 retained positions = 59 spans remain. FINISHED is
+        // NOT empty; it holds the spans of the retained window.
+        assert_eq!(drain().len(), 59);
     }
 
     #[test]

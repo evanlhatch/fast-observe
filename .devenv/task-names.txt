@@ -1,7 +1,0 @@
-devenv:container:copy
-devenv:enterShell
-devenv:enterTest
-devenv:files
-devenv:files:cleanup
-devenv:git-hooks:install
-devenv:git-hooks:run
