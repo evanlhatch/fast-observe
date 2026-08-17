@@ -43,6 +43,58 @@ pub fn error_counts() -> Vec<(&'static str, u64)> {
     v
 }
 
+/// Snapshot of error counts grouped by category, sorted by count descending
+/// (ties by category name, the uncategorized `None` bucket first on ties).
+///
+/// [`error_counts`] is keyed by type name — the category is NOT stored at
+/// record time (the counter sees only a type name, never an error instance).
+/// It is resolved HERE, at read time, from the registry: an error type counts
+/// under category C when the registry holds an entry whose variant name
+/// equals the type's trailing `::` path segment (e.g. `my_crate::errors::Boom`
+/// matches entry `name: "Boom"`). Types with no matching entry — plain
+/// errors, [`InternalError`], the `"reported"` key — land in the `None`
+/// ("uncategorized") bucket.
+///
+/// Heuristic caveats: same-named types in different modules share a bucket,
+/// and on wasm the registry is empty so EVERYTHING is uncategorized.
+#[must_use]
+pub fn error_counts_by_category() -> Vec<(Option<crate::ErrorCategory>, u64)> {
+    let counts = ERROR_COUNTS.lock();
+    let mut buckets: HashMap<Option<crate::ErrorCategory>, u64> = HashMap::new();
+    for (type_name, count) in counts.iter() {
+        *buckets
+            .entry(category_for_type_name(type_name))
+            .or_insert(0) += count;
+    }
+    let mut v: Vec<(Option<crate::ErrorCategory>, u64)> = buckets.into_iter().collect();
+    v.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| category_key(a.0).cmp(category_key(b.0)))
+    });
+    v
+}
+
+/// Read-time category resolution for [`error_counts_by_category`]: match the
+/// type's trailing path segment against registry entry names (see its docs
+/// for the heuristic).
+fn category_for_type_name(type_name: &str) -> Option<crate::ErrorCategory> {
+    let leaf = type_name.rsplit("::").next().unwrap_or(type_name);
+    crate::errors::error_registry()
+        .find(|entry| entry.name == leaf)
+        .map(|entry| entry.category)
+}
+
+/// Sort key for the category bucket: uncategorized (`None`) sorts first.
+fn category_key(category: Option<crate::ErrorCategory>) -> &'static str {
+    match category {
+        None => "",
+        Some(crate::ErrorCategory::Content) => "Content",
+        Some(crate::ErrorCategory::Invariant) => "Invariant",
+        Some(crate::ErrorCategory::Transient) => "Transient",
+        Some(crate::ErrorCategory::Fatal) => "Fatal",
+    }
+}
+
 /// A boxed error — the default `E` for `Fault` / `Result`.
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 pub type SimpleError = BoxError;
@@ -607,6 +659,102 @@ impl<E: Send + Sync + Sized + 'static> Fault<E> {
     pub fn into_frame(self) -> Arc<Frame> {
         self.root
     }
+
+    /// The fault's policy, from the root error's [`crate::errors::CategoryTag`]
+    /// (provided through `Error::provide`) or a registry lookup by the
+    /// provided [`crate::errors::ErrorCode`]. `None` when the error isn't coded.
+    #[must_use]
+    pub fn policy(&self) -> Option<crate::Policy> {
+        frame_category(&self.root).map(crate::ErrorCategory::policy)
+    }
+
+    /// sysexits-style process exit code from the root error's category:
+    /// Content → `EX_DATAERR` (65), Transient → `EX_TEMPFAIL` (75),
+    /// Invariant/Fatal → `EX_SOFTWARE` (70), uncoded → 1.
+    ///
+    /// Category resolution is the same as [`Fault::policy`].
+    #[must_use]
+    pub fn exit_code(&self) -> std::process::ExitCode {
+        let code = match frame_category(&self.root) {
+            Some(crate::ErrorCategory::Content) => 65,
+            Some(crate::ErrorCategory::Transient) => 75,
+            // Invariant/Fatal — plus any future category defaults to a
+            // generic software error rather than "success-adjacent" codes.
+            Some(_) => 70,
+            None => 1,
+        };
+        std::process::ExitCode::from(code)
+    }
+}
+
+/// A frame's category: a provided [`crate::errors::CategoryTag`] first, then
+/// a registry lookup by the provided [`crate::errors::ErrorCode`]. `None`
+/// when neither source knows one. Mirrors `report::frame_category` (kept
+/// private there; both resolve through the same `Error::provide` channel).
+fn frame_category(frame: &Frame) -> Option<crate::ErrorCategory> {
+    if let Some(tag) = core::error::request_value::<crate::errors::CategoryTag>(frame.error()) {
+        return Some(tag.0);
+    }
+    core::error::request_value::<crate::errors::ErrorCode>(frame.error())
+        .and_then(|code| crate::errors::lookup_error(code.0))
+        .map(|entry| entry.category)
+}
+
+/// Run `f`, retrying while failures have [`crate::Policy::Retry`] (see
+/// [`Fault::policy`]), collecting attempts into one [`Fault`] on exhaustion.
+/// Sync; sleeping between attempts is the caller's concern (wasm-safe by
+/// construction).
+///
+/// `max_attempts` is the TOTAL attempt count (clamped to at least 1 — `f`
+/// always runs once). Uncoded errors (policy `None`) and non-Retry policies
+/// return immediately with the fault unchanged. On exhaustion the earlier
+/// attempts are merged under the FINAL attempt's fault — the typed `E` is
+/// preserved, so [`FaultCollection::into_fault_msg`] (which erases `E` to
+/// [`SimpleError`]) cannot be used; the exhaustion message
+/// `"{label}: failed after {n} attempts"` rides in the final fault's
+/// [`Context::Custom`] instead of a new root, and the collected attempts
+/// become children of its root frame.
+///
+/// # Errors
+///
+/// Returns `Err(Fault<E>)` with the first failure when the policy is not
+/// [`crate::Policy::Retry`], or one fault wrapping all attempts after
+/// `max_attempts` Retry-policy failures.
+#[track_caller]
+pub fn retry_with_policy<T, E, F>(
+    label: &'static str,
+    max_attempts: usize,
+    mut f: F,
+) -> Result<T, E>
+where
+    E: Error + Send + Sync + Sized + 'static,
+    F: FnMut() -> core::result::Result<T, E>,
+{
+    let max_attempts = max_attempts.max(1);
+    let mut collection = FaultCollection::new();
+    let mut attempts = 0usize;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let mut fault = Fault::new(e);
+                attempts += 1;
+                if fault.policy() == Some(crate::Policy::Retry) && attempts < max_attempts {
+                    collection.push(fault);
+                    continue;
+                }
+                if !collection.is_empty()
+                    && let Some(root) = Arc::get_mut(&mut fault.root)
+                {
+                    root.context = Context::Custom(
+                        format!("{label}: failed after {attempts} attempts").into(),
+                    );
+                    root.children.append(&mut collection.frames);
+                }
+                return Err(fault);
+            }
+        }
+    }
 }
 
 impl<E: Send + Sync + Sized + 'static> Deref for Fault<E> {
@@ -1030,13 +1178,20 @@ impl<E: Send + Sync + Sized + 'static> fmt::Debug for Fault<E> {
 }
 
 /// Render the fault tree: one line per frame (`error, at file:line:col
-/// [context]`), children nested under `|-- `/``-- `` connectors. Inline
+/// [context]`), children nested under `|-- `/``-- `` connectors. When the
+/// frame's error provides an [`crate::errors::ErrorCode`] (through
+/// `Error::provide`), the line carries a `[CODE] ` prefix between the
+/// connector and the message: `` `-- [E428] pipeline layout: io: closed ``.
+/// Inline
 /// attachments render as leading pseudo-children (`* {display}` lines)
 /// BEFORE real children, sharing the sibling last-ness — the last line under
 /// a frame (attachment or child) gets ``-- ``, the rest `|-- `. Non-inline
 /// attachments are not rendered in-tree; the frame's own line gets a
 /// ` (+N more attachments)` suffix when N > 0.
 fn write_fault(f: &mut fmt::Formatter<'_>, frame: &Frame, prefix: &str) -> fmt::Result {
+    if let Some(code) = core::error::request_value::<crate::errors::ErrorCode>(frame.error()) {
+        write!(f, "[{}] ", code.0)?;
+    }
     write!(f, "{}", frame.error)?;
     let loc = frame.location;
     write!(f, ", at {}:{}:{}", loc.file(), loc.line(), loc.column())?;

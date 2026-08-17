@@ -106,7 +106,12 @@ has landed. Items marked *(landing)* are in DESIGN.md but not yet in `src/`.
    `.init()? -> InitGuard`. Unlike `hook::init()` (which stays the
    zero-config path and still swallows double-init), the builder reports
    `InitError::AlreadyInitialized`, and dropping `InitGuard` flushes
-   fastrace. `init()` delegating to the builder is planned, not landed.
+   fastrace. `hook::init()` now delegates to the builder
+   (`observe().init()` with the result ignored). Builder-only toggles:
+   `panic_hook` (default `true` — panics logged as structured error events
+   on target `fast_observe.panic`, then the previous hook runs) and
+   `flush_on_exit` (default `true`; feature `flush-on-exit`, native only —
+   best-effort fastrace flush on atexit/SIGTERM/SIGHUP).
 3. **Capture hooks** (new hook family): `add_capture_hook(fn(&mut Frame))`
    runs DURING frame construction and may attach data. Built-ins attach the
    fastrace `trace_id` (feature `fastrace`, plus an `error` span event) and
@@ -130,16 +135,47 @@ has landed. Items marked *(landing)* are in DESIGN.md but not yet in `src/`.
 8. **`SamplingReporter` / `MultiReporter`** (feature `fastrace`): traces
    with an `error` span event are always kept, clean traces sampled 1-in-N;
    fan-out to several reporters (console + OTel).
-9. **`error!` proc macro** *(landing)* — thiserror-attribute syntax +
-   `#[code]`/`#[category]`/`#[advice]` in `fast-observe-macros`.
-   `define_errors!` is unchanged and remains the current path; once
-   `error!` lands it stays one release as the deprecated alias.
-10. **Report module** *(landing)* — the prescriptive `render_report`
-    renderer (DESIGN.md §7). The pieces it renders (trace id, scope path,
-    attachments, policy line) are already captured.
+9. **`error!` proc macro** — thiserror-attribute syntax (`#[error]`,
+   `#[from]`, `#[source]`) + `#[code]`/`#[category]`/`#[advice]` in
+   `fast-observe-macros`, re-exported as `fast_observe::error!`. Generates
+   the enum, one public struct per struct variant, `Display`/`Error` with
+   auto-wired `source()`, `From<Variant>` for the enum AND for
+   `Fault<Enum>`, registry entries with advice (default: first doc line),
+   nightly `Error::provide` of `ErrorCode`/`CategoryTag`, and a 64-byte
+   size assertion. v1 limits: no generics; `#[from]` needs a single-field
+   tuple variant; no `From<InnerType> for Fault<Enum>` (orphan rule) —
+   write `err.map_err(Enum::from)?`. `define_errors!` is now the
+   deprecated path, supported through 0.x.
+10. **Report module** — the prescriptive renderer (DESIGN.md §7):
+    `render_report(&fault) -> String`, `report_display(&fault)` (streaming
+    `Display`), `render_report_json(&fault)` (feature `serde`, versioned
+    `"schema": 1`). Fixed section order, one fact per line, no colors or
+    timestamps. Codes/categories are read through `Error::provide` with a
+    registry fallback, so `error!` types report fully.
 11. **`Coded` trait + `ErrorCode`/`CategoryTag`** — codes/categories
-    through `Error::provide` (nightly `error_generic_member_access`);
-    `define_errors!` emitting `Coded` impls is landing.
+    through `Error::provide` (nightly `error_generic_member_access`).
+    `error!`-generated types provide them automatically; `define_errors!`
+    does NOT emit `Coded` impls *(landing)*.
+12. **anyhow boundary** (feature `anyhow-boundary`) —
+    `compat::anyhow_boundary::{from_anyhow, into_anyhow}`: explicit
+    `map_err` points, never implicit `From`. anyhow erases its sources, so
+    the wrapped chain survives via `{:#}`/`{:?}` formatting only; typed
+    `Fault` → anyhow keeps the causal tree through `Fault`'s `source()`/
+    `Debug`. `Fault<SimpleError>` cannot go into anyhow (a boxed dyn error
+    is not `Error`). `compat-eyre` / `compat-error-stack` / `int-tokio` /
+    `retry_with_policy` are now LANDED — see below.
+13. **eyre / error-stack / tokio boundaries + policy helpers** (features
+    `compat-eyre`, `compat-error-stack`, `int-tokio`) —
+    `eyre_boundary::{from_eyre, into_eyre}`;
+    `error_stack_boundary::{from_error_stack, into_error_stack}`
+    preserving the typed context + frame stack (note: `into_error_stack`
+    returns `Report<Fault<E>>` — the Fault becomes the context, `Deref`
+    reaches E); `tokio_ext::ObserveJoinExt::observe_join` distinguishing
+    cancelled vs panicked tasks. Also landed: `retry_with_policy`
+    (policy-driven retries, attempts collected into one fault),
+    `Fault::policy()` / `exit_code()` (sysexits),
+    `error_counts_by_category()` (registry-suffix heuristic), codes in the
+    Debug tree via `Error::provide`.
 
 ### Behavior changes (precise)
 
@@ -167,3 +203,15 @@ has landed. Items marked *(landing)* are in DESIGN.md but not yet in `src/`.
    selected backend (ZST stubs for the rest); mask 0 = all-dummy, ~2ns.
 8. **`with_context` / attachments on a shared root** now `debug_assert!`
    instead of silently no-oping.
+9. **`fastrace` feature forwards `fastrace/enable`.** fast-observe is the
+   app-facing deployment crate — without `enable` every fastrace span
+   silently no-ops. Libraries depending on fast-observe must use
+   `default-features = false` and let the binary enable fastrace
+   (fastrace's library-level-tracing rule).
+10. **Panic hook installed by default.** The `observe()` builder defaults
+    `panic_hook(true)`: panics are logged as structured error events
+    (target `fast_observe.panic`, kv `panic_file`/`panic_line`), then the
+    previously installed hook runs — chaining, never stomping. Opt out
+    with `.panic_hook(false)`. With feature `flush-on-exit` (native),
+    `flush_on_exit(true)` additionally flushes fastrace on
+    atexit/SIGTERM/SIGHUP.

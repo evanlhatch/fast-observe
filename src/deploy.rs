@@ -126,6 +126,27 @@ impl<S: deployment_builder::State> DeploymentBuilder<S> {
 }
 
 impl Deployment {
+    /// Begin configuring from a [`DeploymentConfig`] — equivalent to
+    /// `cfg.apply(observe())`. Finish with [`Deployment::init`].
+    ///
+    /// # Errors
+    /// Returns the collected [`ConfigError`]s when any field fails to parse;
+    /// nothing is applied in that case.
+    pub fn from_config(cfg: DeploymentConfig) -> Result<Self, Vec<ConfigError>> {
+        cfg.apply(observe())
+    }
+
+    /// Terminal: wire logs + traces + profiling per the toggles — the
+    /// [`DeploymentBuilder::init`] equivalent for a [`Deployment`] produced
+    /// by [`DeploymentConfig::apply`] / [`Deployment::from_config`].
+    ///
+    /// # Errors
+    /// Same as [`DeploymentBuilder::init`]: [`InitError::AlreadyInitialized`]
+    /// when the global `log` logger was already set.
+    pub fn init(self) -> Result<InitGuard, InitError> {
+        self.wire()
+    }
+
     fn wire(self) -> Result<InitGuard, InitError> {
         let Self {
             level,
@@ -249,6 +270,187 @@ impl Deployment {
         Ok(InitGuard { _private: () })
     }
 }
+
+/// Plain-data mirror of the builder: every field `Option`, every choice a
+/// string-parsable value. Apps embed this in their own config
+/// (figment/config-rs/toml) and convert — fast-observe stays
+/// figment-compatible, NOT figment-dependent (SURFACE.md §2). Feature
+/// `serde` gives `Serialize`/`Deserialize`; the type exists without it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct DeploymentConfig {
+    /// Max log level: `off|error|warn|info|debug|trace` (case-insensitive),
+    /// parsed via [`log::LevelFilter::from_str`](std::str::FromStr).
+    pub level: Option<String>,
+    /// Stdout appender toggle.
+    pub stdout: Option<bool>,
+    /// Stdout layout: `text` | `json` (case-insensitive).
+    pub layout: Option<String>,
+    /// Rolling file appender from `OBSERVE_LOG_DIR` (feature `file`).
+    pub file_from_env: Option<bool>,
+    /// Profiling backend mask — `OBSERVE_PROFILE` syntax: a comma-separated,
+    /// case-insensitive list (`off|instant|fastrace|web|puffin|tracy|
+    /// superluminal|tracing`), parsed via
+    /// [`Backends::from_env_value`](crate::config::Backends::from_env_value).
+    pub backends: Option<String>,
+    /// Error-hook throttle (per error type per second).
+    pub error_hook_throttle: Option<u32>,
+    /// fastrace reporter choice: `console` | `off` (case-insensitive).
+    pub traces: Option<String>,
+    /// Panic hook toggle.
+    pub panic_hook: Option<bool>,
+    /// Best-effort fastrace flush on process exit toggle (feature
+    /// `flush-on-exit`, native only).
+    pub flush_on_exit: Option<bool>,
+}
+
+impl DeploymentConfig {
+    /// Overlay onto a builder — `Some` fields win, `None` leaves the
+    /// builder's current value (the default, or whatever earlier setters
+    /// established). Works on any builder state: bon 3's setters transition
+    /// the typestate (`S::X: IsUnset` → `SetX<S>`), so conditional
+    /// application cannot go through the setters; instead the builder is
+    /// finished and the parsed values are overlaid on the built
+    /// [`Deployment`]. Parse errors are collected and returned; nothing is
+    /// applied on `Err`. Finish with [`Deployment::init`].
+    ///
+    /// # Errors
+    /// Returns every [`ConfigError`] for the fields that failed to parse
+    /// (not first-wins).
+    pub fn apply<S: deployment_builder::State>(
+        self,
+        builder: DeploymentBuilder<S>,
+    ) -> Result<Deployment, Vec<ConfigError>> {
+        let Self {
+            level,
+            stdout,
+            layout,
+            file_from_env,
+            backends,
+            error_hook_throttle,
+            traces,
+            panic_hook,
+            flush_on_exit,
+        } = self;
+        let mut errors = Vec::new();
+
+        // Parse first; the builder is only finished once every field is
+        // known-good, so `Err` leaves nothing applied.
+        let level = level.and_then(|value| {
+            if let Ok(parsed) = value.trim().parse::<log::LevelFilter>() {
+                Some(parsed)
+            } else {
+                errors.push(ConfigError {
+                    field: "level",
+                    value,
+                    reason: "expected off|error|warn|info|debug|trace",
+                });
+                None
+            }
+        });
+        let layout = layout.and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(LayoutChoice::Text),
+            "json" => Some(LayoutChoice::Json),
+            _ => {
+                errors.push(ConfigError {
+                    field: "layout",
+                    value,
+                    reason: "expected text|json",
+                });
+                None
+            }
+        });
+        let backends = backends.and_then(|value| {
+            if let Some(parsed) = crate::config::Backends::from_env_value(&value) {
+                Some(parsed)
+            } else {
+                errors.push(ConfigError {
+                    field: "backends",
+                    value,
+                    reason: "expected comma-separated off|instant|fastrace|web|puffin|tracy|superluminal|tracing (`off` alone)",
+                });
+                None
+            }
+        });
+        let traces = traces.and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "console" => Some(TracesChoice::Console),
+            "off" => Some(TracesChoice::Off),
+            _ => {
+                errors.push(ConfigError {
+                    field: "traces",
+                    value,
+                    reason: "expected console|off",
+                });
+                None
+            }
+        });
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        // Every field parsed — overlay onto the built deployment; `None`
+        // leaves the builder's value untouched.
+        let mut deployment = builder.build();
+        if let Some(level) = level {
+            deployment.level = Some(level);
+        }
+        if let Some(stdout) = stdout {
+            deployment.stdout = stdout;
+        }
+        if let Some(layout) = layout {
+            deployment.layout = layout;
+        }
+        if let Some(file_from_env) = file_from_env {
+            deployment.file_from_env = file_from_env;
+        }
+        if let Some(backends) = backends {
+            deployment.backends = Some(backends);
+        }
+        if let Some(error_hook_throttle) = error_hook_throttle {
+            deployment.error_hook_throttle = Some(error_hook_throttle);
+        }
+        if let Some(traces) = traces {
+            deployment.traces = traces;
+        }
+        if let Some(panic_hook) = panic_hook {
+            deployment.panic_hook = panic_hook;
+        }
+        if let Some(flush_on_exit) = flush_on_exit {
+            deployment.flush_on_exit = flush_on_exit;
+        }
+        Ok(deployment)
+    }
+}
+
+/// One failed [`DeploymentConfig`] field parse. `field` names the config
+/// key, `value` is the offending input, `reason` names the expected values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    /// The config field that failed to parse (e.g. `"level"`).
+    pub field: &'static str,
+    /// The offending input value.
+    pub value: String,
+    /// What the field expects (e.g. `"expected text|json"`).
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            field,
+            value,
+            reason,
+        } = self;
+        write!(
+            f,
+            "invalid observe config field `{field}` = {value:?} — {reason}"
+        )
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// Install a panic hook that logs the panic as a structured error event
 /// THROUGH the log pipeline (target `fast_observe.panic`, kv fields
@@ -458,6 +660,103 @@ mod tests {
         assert!(matches!(d.traces, TracesChoice::Off));
         assert!(!d.panic_hook);
         assert!(!d.flush_on_exit);
+    }
+
+    #[test]
+    fn config_apply_sets_fields() {
+        let cfg = DeploymentConfig {
+            level: Some("debug".to_owned()),
+            stdout: Some(false),
+            layout: Some("json".to_owned()),
+            file_from_env: Some(true),
+            backends: Some("fastrace,tracy".to_owned()),
+            error_hook_throttle: Some(7),
+            traces: Some("off".to_owned()),
+            panic_hook: Some(false),
+            flush_on_exit: Some(false),
+        };
+        // Never `.init()` — the global logger is per-process.
+        let Ok(d) = cfg.apply(observe()) else {
+            unreachable!("all-Some config must apply")
+        };
+        assert_eq!(d.level, Some(log::LevelFilter::Debug));
+        assert!(!d.stdout);
+        assert!(matches!(d.layout, LayoutChoice::Json));
+        assert!(d.file_from_env);
+        assert_eq!(
+            d.backends,
+            Some(crate::config::Backends::FASTRACE | crate::config::Backends::TRACY)
+        );
+        assert_eq!(d.error_hook_throttle, Some(7));
+        assert!(matches!(d.traces, TracesChoice::Off));
+        assert!(!d.panic_hook);
+        assert!(!d.flush_on_exit);
+    }
+
+    #[test]
+    fn config_apply_collects_errors_and_leaves_defaults() {
+        let cfg = DeploymentConfig {
+            level: Some("bogus".to_owned()),
+            backends: Some("nope".to_owned()),
+            ..DeploymentConfig::default()
+        };
+        let Err(errors) = cfg.apply(observe()) else {
+            unreachable!("bad values must not apply")
+        };
+        assert_eq!(errors.len(), 2, "errors collected, not first-wins");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "level" && e.value == "bogus")
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "backends" && e.value == "nope")
+        );
+
+        // All-None config is a no-op overlay: builder keeps its defaults.
+        let Ok(d) = DeploymentConfig::default().apply(observe()) else {
+            unreachable!("all-None config must apply")
+        };
+        assert!(d.level.is_none());
+        assert!(d.stdout);
+        assert!(matches!(d.layout, LayoutChoice::Text));
+        assert!(!d.file_from_env);
+        assert!(d.backends.is_none());
+        assert!(d.error_hook_throttle.is_none());
+        assert!(matches!(d.traces, TracesChoice::Console));
+        assert!(d.panic_hook);
+        assert!(d.flush_on_exit);
+    }
+
+    #[test]
+    fn config_apply_overlays_preset_builder() {
+        // `Some` wins over an earlier setter; `None` preserves it.
+        let builder = observe()
+            .level(log::LevelFilter::Error)
+            .error_hook_throttle(3);
+        let cfg = DeploymentConfig {
+            level: Some("debug".to_owned()),
+            ..DeploymentConfig::default()
+        };
+        let Ok(d) = cfg.apply(builder) else {
+            unreachable!("valid config must apply")
+        };
+        assert_eq!(d.level, Some(log::LevelFilter::Debug), "Some wins");
+        assert_eq!(d.error_hook_throttle, Some(3), "None preserves the setter");
+    }
+
+    #[test]
+    fn from_config_matches_apply_on_observe() {
+        let cfg = DeploymentConfig {
+            level: Some("warn".to_owned()),
+            ..DeploymentConfig::default()
+        };
+        let Ok(d) = Deployment::from_config(cfg) else {
+            unreachable!("valid config must apply")
+        };
+        assert_eq!(d.level, Some(log::LevelFilter::Warn));
     }
 
     #[test]

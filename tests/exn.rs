@@ -1,12 +1,21 @@
 //! `Fault` / `Context` / `bail!` behavior. Display strings here appear in
 //! logs and crash dumps — changing them is a breaking observability change.
 //! (See MIGRATING.md for provenance.)
+// Integration tests are separate crates — the nightly gate must be enabled
+// here, not inherited from the library root (needed by the `error!` macro's
+// generated `Error::provide` overrides).
+#![feature(error_generic_member_access)]
 
 use core::fmt;
+use std::cell::Cell;
 use std::error::Error;
+use std::process::ExitCode;
 
-use fast_observe::exn::{Context, Fault, FaultCollection, OptionExt, Placement, Result, ResultExt};
-use fast_observe::{ErrorCategory, bail};
+use fast_observe::exn::{
+    Context, Fault, FaultCollection, OptionExt, Placement, Result, ResultExt,
+    error_counts_by_category, retry_with_policy,
+};
+use fast_observe::{ErrorCategory, Policy, bail};
 
 // ── Context Display stability — these strings appear in logs and crash
 // dumps; changing them is a breaking observability change.
@@ -391,4 +400,140 @@ fn into_fault_msg_wraps_collected_under_plain_message() {
     assert!(agg.to_string().contains("batch failed"));
     assert_eq!(agg.frame().children().len(), 1);
     assert_eq!(agg.iter().count(), 2, "message root + one subtree");
+}
+
+// ── Coded errors: code-in-tree, policy, exit codes, retry ────────────────
+
+// Coded test errors via the real `error!` macro — exercises the registry
+// registration + `Error::provide` path end-to-end. The VARIANT STRUCTS
+// (`TransientBoom` / `ContentBoom`) are what tests construct: their
+// `type_name` leaf matches the registry entry's `name`, which
+// `error_counts_by_category` relies on.
+fast_observe::error! {
+    /// Errors for code/policy/retry tests.
+    #[derive(Debug)]
+    pub enum RetryTestError {
+        /// transient failure — retryable
+        #[error("transient boom")]
+        #[code = "E901", category = Transient]
+        TransientBoom {},
+
+        /// content failure — fix the input
+        #[error("content boom")]
+        #[code = "E902", category = Content]
+        ContentBoom {},
+    }
+}
+
+#[test]
+fn debug_tree_shows_codes() {
+    // Root is coded, wrapped child is coded: both lines carry `[CODE] `.
+    let inner = Fault::new(TransientBoom {});
+    let wrapped = inner.wrap(ContentBoom {});
+    let dbg = format!("{wrapped:?}");
+    assert!(
+        dbg.contains("[E902] content boom, at"),
+        "root line carries the code prefix: {dbg}"
+    );
+    assert!(
+        dbg.contains("`-- [E901] transient boom, at"),
+        "child line carries the code prefix after the connector: {dbg}"
+    );
+}
+
+#[test]
+fn policy_and_exit_code() {
+    let transient = Fault::new(TransientBoom {});
+    assert_eq!(transient.policy(), Some(Policy::Retry));
+    assert_eq!(transient.exit_code(), ExitCode::from(75));
+
+    let content = Fault::new(ContentBoom {});
+    assert_eq!(content.policy(), Some(Policy::FixInput));
+    assert_eq!(content.exit_code(), ExitCode::from(65));
+
+    let plain = Fault::from("plain");
+    assert_eq!(plain.policy(), None);
+    assert_eq!(plain.exit_code(), ExitCode::from(1));
+}
+
+#[test]
+fn retry_with_policy_retries_transient() {
+    let counter = Cell::new(0u32);
+    let result: Result<u32, TransientBoom> = retry_with_policy("flaky-op", 3, || {
+        counter.set(counter.get() + 1);
+        if counter.get() < 3 {
+            Err(TransientBoom {})
+        } else {
+            Ok(7)
+        }
+    });
+    assert_eq!(result.unwrap(), 7);
+    assert_eq!(counter.get(), 3, "two failures + one success");
+}
+
+#[test]
+fn retry_with_policy_no_retry_on_content() {
+    let counter = Cell::new(0u32);
+    let result: Result<u32, ContentBoom> = retry_with_policy("rigid-op", 5, || {
+        counter.set(counter.get() + 1);
+        Err(ContentBoom {})
+    });
+    let fault = result.unwrap_err();
+    assert_eq!(counter.get(), 1, "Content policy is FixInput — no retries");
+    // Immediate return: the fault is unchanged (no exhaustion message).
+    assert_eq!(fault.to_string(), "content boom");
+
+    // Uncoded errors (policy None) also get no retries.
+    let uncoded = Cell::new(0u32);
+    let result: Result<u32, TestErr> = retry_with_policy("plain-op", 5, || {
+        uncoded.set(uncoded.get() + 1);
+        Err(TestErr)
+    });
+    assert!(result.is_err());
+    assert_eq!(uncoded.get(), 1, "uncoded errors return immediately");
+}
+
+#[test]
+fn retry_with_policy_collects_on_exhaustion() {
+    let counter = Cell::new(0u32);
+    let result: Result<u32, TransientBoom> = retry_with_policy("doomed-op", 3, || {
+        counter.set(counter.get() + 1);
+        Err(TransientBoom {})
+    });
+    let fault = result.unwrap_err();
+    assert_eq!(counter.get(), 3, "max_attempts is the total attempt count");
+    // One fault wrapping all attempts: the final attempt is the root, the
+    // earlier attempts are children of its frame.
+    assert_eq!(fault.iter().count(), 3, "all 3 attempts in one tree");
+    let msg = fault.to_string();
+    assert!(msg.contains("doomed-op"), "label in message: {msg}");
+    assert!(
+        msg.contains("failed after 3 attempts"),
+        "attempt count in message: {msg}"
+    );
+    let dbg = format!("{fault:?}");
+    assert_eq!(
+        dbg.matches("[E901]").count(),
+        3,
+        "every attempt frame carries its code: {dbg}"
+    );
+}
+
+#[test]
+fn error_counts_by_category_buckets() {
+    // Construct one coded + one plain error so both bucket kinds exist.
+    // (ERROR_COUNTS is process-global — assertions are presence-based.)
+    let _coded = Fault::new(TransientBoom {});
+    let _plain = Fault::new(TestErr);
+    let buckets = error_counts_by_category();
+    assert!(
+        buckets
+            .iter()
+            .any(|(cat, n)| *cat == Some(ErrorCategory::Transient) && *n >= 1),
+        "coded type bucketed under Some(Transient): {buckets:?}"
+    );
+    assert!(
+        buckets.iter().any(|(cat, n)| cat.is_none() && *n >= 1),
+        "plain types land in the None bucket: {buckets:?}"
+    );
 }

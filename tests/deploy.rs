@@ -3,7 +3,7 @@
 //! test here shares one init via [`ensure_init`]; other test binaries must
 //! not call `init()`.
 
-use fast_observe::deploy::{InitError, InitGuard, observe};
+use fast_observe::deploy::{DeploymentConfig, InitError, InitGuard, observe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 
@@ -72,4 +72,105 @@ fn panic_hook_chains() {
             "deployment panic hook must chain to the previously installed hook"
         );
     }
+}
+
+// DeploymentConfig tests: apply-only, never init() — the builder's fields
+// are private, so assertions are success/failure of apply plus the serde
+// roundtrip. Field-level behavior is covered by the unit tests in
+// src/deploy.rs (same module = private-field access).
+
+fn full_config() -> DeploymentConfig {
+    DeploymentConfig {
+        level: Some("debug".to_owned()),
+        stdout: Some(false),
+        layout: Some("json".to_owned()),
+        file_from_env: Some(true),
+        backends: Some("fastrace,tracy".to_owned()),
+        error_hook_throttle: Some(7),
+        traces: Some("off".to_owned()),
+        panic_hook: Some(false),
+        flush_on_exit: Some(false),
+    }
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "test")]
+fn config_apply_sets_fields() {
+    // Deployment has no Debug impl, but the Err side (Vec<ConfigError>)
+    // does, so `expect` works for the Ok-expecting direction.
+    let _deployment = full_config()
+        .apply(observe())
+        .expect("all-Some valid config must apply");
+    // Deployment::from_config is the same overlay on observe().
+    let cfg = DeploymentConfig {
+        level: Some("warn".to_owned()),
+        ..DeploymentConfig::default()
+    };
+    let _deployment = fast_observe::Deployment::from_config(cfg)
+        .expect("valid config must apply via from_config");
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "test")]
+fn config_apply_rejects_bad_values() {
+    // `.err()` not `.expect_err()`: Deployment has no Debug impl.
+    let bad_level = DeploymentConfig {
+        level: Some("bogus".to_owned()),
+        ..DeploymentConfig::default()
+    };
+    let errors = bad_level
+        .apply(observe())
+        .err()
+        .expect("bogus level must fail");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].field, "level");
+    assert_eq!(errors[0].value, "bogus");
+
+    let bad_backends = DeploymentConfig {
+        backends: Some("nope".to_owned()),
+        ..DeploymentConfig::default()
+    };
+    let errors = bad_backends
+        .apply(observe())
+        .err()
+        .expect("bogus backends must fail");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].field, "backends");
+    assert_eq!(errors[0].value, "nope");
+
+    // Multiple bad fields → collected, not first-wins.
+    let both_bad = DeploymentConfig {
+        level: Some("bogus".to_owned()),
+        backends: Some("nope".to_owned()),
+        ..DeploymentConfig::default()
+    };
+    let errors = both_bad
+        .apply(observe())
+        .err()
+        .expect("two bogus fields must fail");
+    assert_eq!(errors.len(), 2, "errors collected, not first-wins");
+    assert!(errors.iter().any(|e| e.field == "level"));
+    assert!(errors.iter().any(|e| e.field == "backends"));
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "test")]
+fn config_apply_none_fields_are_noops() {
+    let _deployment = DeploymentConfig::default()
+        .apply(observe())
+        .expect("all-None config must apply");
+}
+
+#[cfg(feature = "serde")]
+#[test]
+#[allow(clippy::expect_used, reason = "test")]
+fn config_roundtrip_json() {
+    let cfg = full_config();
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    let back: DeploymentConfig = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(cfg, back);
+
+    // `deny_unknown_fields` rejects a bogus key.
+    let bogus: Result<DeploymentConfig, _> = serde_json::from_str(r#"{"levl": "info"}"#);
+    assert!(bogus.is_err(), "unknown field `levl` must be rejected");
 }

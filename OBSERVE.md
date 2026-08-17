@@ -22,9 +22,17 @@ almost nothing.
 ## The vocabulary (this is the whole thing)
 
 ```rust
-use fast_observe::prelude::*;   // [landing] one import. Until the prelude
-                                // lands, import items directly:
-                                // fast_observe::{bail, ensure, scope, ResultExt, OptionExt, Fault, Result}
+use fast_observe::prelude::*;   // [live] one import: Fault/Frame/Result/ResultExt/
+                                // OptionExt, bail!/ensure!/scope!/finish_frame!/error!/
+                                // define_errors!, instrument/all_functions/skip, init/observe,
+                                // doctor/lookup_error/error_registry/error_counts,
+                                // render_report/report_display, add_error_hook/
+                                // add_capture_hook, config/Backends, Category/Policy/
+                                // Attachment/Placement/Coded. NOT in it: profiling!/
+                                // func_path! (the `profiling` name would collide with the
+                                // profiling module), root_span!/in_observed_span,
+                                // render_report_json, Deployment/InitGuard/InitError —
+                                // import those from their modules.
 
 log::info!(user_id = 42; "connected");   // [live] POINTS: plain log macros. No
                                           // fast-observe logging API exists.
@@ -40,11 +48,13 @@ ensure!(x > 0, MyError { detail });       // emitted. bail! ALSO logs, counts,
                                           // write log::error! + return Err.
 ```
 
-Plus `#[instrument]` on a fn (or `#[all_functions]` on an impl block —
-both [live], from `fast_observe::profiling`, expanding to `::fast_observe`
-paths) to instrument without writing `scope!` by hand. Defining typed
-errors with codes: `define_errors!` is [live]; the thiserror-style `error!`
-proc macro is [landing] (SURFACE.md §5).
+Plus `#[instrument]` on a fn (or `#[all_functions]` on an impl block
+with `#[skip]` opt-outs — all [live], from `fast_observe_macros`,
+re-exported at the crate root and in the prelude, expanding to
+`::fast_observe` paths) to instrument without writing `scope!` by hand.
+Defining typed errors with codes: the thiserror-style `error!` proc macro
+is [live] and the primary path; `define_errors!` stays supported through
+0.x as the deprecated alias.
 
 That's it. If you know `log` and `anyhow`, you already know the verbs.
 
@@ -60,61 +70,84 @@ fn main() -> fast_observe::Result<()> {   // Result works like anyhow's
 Configurable path [live]: `let _guard = fast_observe::observe().level(..).
 file_from_env(true).init()?;` — the `Deployment` builder returns an
 `InitGuard` whose drop flushes fastrace, and double-init is an
-`Err(InitError)` instead of silently ignored.
+`Err(InitError)` instead of silently ignored. Two more builder defaults
+[live]: `panic_hook(true)` logs panics as structured error events (target
+`fast_observe.panic`), then chains the previously installed hook — never
+stomped; `flush_on_exit(true)` (feature `flush-on-exit`, native only)
+flushes fastrace on atexit/SIGTERM/SIGHUP.
 
 Env knobs: `OBSERVE_PROFILE` [live] (comma list: `fastrace`, `instant`,
 `puffin`, `tracy`, …; default `fastrace`), `OBSERVE_LOG` [live, honored by
 the `observe()` builder; falls back to `RUST_LOG`, then `info`],
-`OBSERVE_LOG_DIR` [live, with feature `file`], `RUST_BACKTRACE=1`
-[landing]. Runtime [live]:
+`OBSERVE_LOG_DIR` [live, with feature `file`], `RUST_BACKTRACE=1`/`full`
+[live, with feature `backtrace` — the built-in capture hook attaches a
+forced backtrace as an Appendix attachment; `OBSERVE_BACKTRACE` overrides
+in both directions]. Runtime [live]:
 `config().set_backends(Backends::FASTRACE | Backends::TRACY)` —
 compiled-in ≠ active; features compile backends, the mask selects them.
 Asking for an uncompiled backend logs a warning naming the cargo feature.
 
 ## Errors
 
-Typed errors with codes, the [live] form:
+Typed errors with codes, the [live] form — `error!` takes
+thiserror-attribute syntax plus `#[code]`/`#[category]`/`#[advice]`:
 
 ```rust
-fast_observe::define_errors! {
-    enum EngineError {
-        (EntityNotFound, "E001", Content, "entity not found",
-            "entity not found: {id}", { id: u64 });
+fast_observe::error! {
+    #[derive(Debug)]
+    pub enum EngineError {
+        /// check the entity table
+        #[error("entity not found: {id}")]
+        #[code = "E001", category = Content]
+        EntityNotFound { id: u64 },
+
+        #[error("io: {0}")]
+        #[code = "E002", category = Transient, advice = "retry the io operation"]
+        #[from]
+        Io(std::io::Error),
     }
 }
-// you hand-write: `enum EngineError { EntityNotFound(EntityNotFound) }`,
-// `impl Error`, and (for foreign sources) the source() wiring.
+// Generates: the enum + one public struct per struct variant,
+// Display/Error with auto-wired source(), From<Variant> for the enum AND
+// for Fault<Enum>, registry entries with advice (default: first doc line),
+// nightly Error::provide of the code/category, a 64-byte size assertion.
 
-fn load(id: u64) -> Result<Entity, EngineError> {
+fn load(id: u64) -> fast_observe::Result<Entity, EngineError> {
     let e = repo.find(id).change_context(EngineError::from(EntityNotFound { id }))?; // [live]
+    // or return the variant straight into a fault: `Err(EntityNotFound { id })?`
+    // `#[from]` gives From<io::Error> for the enum but NOT for Fault<Enum>
+    // (orphan rule) — write `err.map_err(EngineError::from)?`.
     // .wrap_msg("loading entity") for the anyhow-style message form [live];
     // .context(...) aliases are [landing] (SURFACE.md §6a)
     Ok(e)
 }
 ```
 
-The [landing] `error!` macro upgrades this to thiserror-attribute syntax
-(`#[error]`, `#[from]`, `#[source]` + `#[code]`/`#[category]`/`#[advice]`)
-and generates the enum, `Error` impl with auto-wired `source()`, registry
-entries with advice, and size assertions (SURFACE.md §5).
+The macro_rules `define_errors!` covers the same surface in compact form
+— [live], supported through 0.x, but deprecated: new code uses `error!`.
 
-The report renderer is [landing] (DESIGN.md §7; no `report.rs` yet) — the
-shape of its output, one fact per line, deterministic, no colors, no
-timestamps:
+The report renderer is [live]: `render_report(&fault) -> String`,
+`report_display(&fault)` (streaming `Display`, no report-string
+allocation), `render_report_json(&fault)` (feature `serde`, versioned
+`"schema": 1`). Codes/categories are read through `Error::provide` with a
+registry fallback, so `error!` types report fully. One fact per line,
+deterministic, no colors, no timestamps:
 
 ```
 error: [E001] entity not found: 17
-category: Content (policy: fix input; retrying unchanged input will fail)
+category: Content (policy: fix the input; retrying unchanged input will fail)
 location: src/repo.rs:42:10
-scope: request → load_entity (elapsed 3.1ms)
+scope: request → load_entity (elapsed 3ms)
+attachment: attempt=3
 cause 0: [E001] entity not found: 17
 trace_id: 4f3c9a2b…          # same id on every log line and span
 advice: check the entity table
-action: fix the input and re-run; see `<bin> doctor E001`
+action: fix the input; retrying unchanged input will fail; see `doctor E001`
 ```
 
-What feeds it is already [live]: every `Fault` captures the caller location,
-the fastrace `trace_id` and the scope path + leaf elapsed as attachments
+What feeds it [all live]: every `Fault` captures the caller location, the
+fastrace `trace_id` (and emits an `error` span event, so the failure lands
+in the trace timeline) and the scope path + leaf elapsed as attachments
 (built-in capture hooks), nests the `source()` chain into the tree, and
 renders the tree via `Debug`. `doctor(code)` renders the registry entry +
 policy line as `key: value` text.
@@ -140,19 +173,28 @@ the `Backends` mask — compiled-in ≠ active). `finish_frame!` marks tick
 boundaries for the instant/puffin backends.
 
 Async: `scope!` guards are thread-bound — do NOT hold them across `.await`.
-`#[instrument]`/`#[all_functions]` [live] reject async fns at compile time;
-cross-await spans use `fastrace::trace(enter_on_poll = true)` [live, via the
-fastrace dep] or `in_observed_span` / `root_span!` [landing].
+`#[instrument]`/`#[all_functions]` [live] reject async fns at compile time
+— deliberate: a guard held across `.await` records against whatever thread
+polls next. Cross-await spans [live, feature `fastrace`]: bind
+`fast_observe::root_span!("request")` once per task (continue an incoming
+trace with `root_span!("request", ctx)`), wrap futures with
+`.in_observed_span("load")` (`profiling::async_::ObservedFutureExt`) — the
+span enters on every poll and follows the task across threads. W3C
+`traceparent` helpers (`extract_traceparent`/`inject_traceparent`) live in
+`profiling::async_` too; `fastrace::trace(enter_on_poll = true)` via the
+fastrace dep also works.
 
-Benchmarks: `#[fast_observe::bench]` (divan) and
-`bencher.bench_profiled(..)` for per-phase span breakdown are [landing]
-(DESIGN.md §9d).
+Benchmarks [live, feature `bench` — implies `instant`]:
+`fast_observe::bench` re-exports divan (write `#[divan::bench(crate =
+fast_observe::bench::divan)]` — the attribute itself is not wrapped);
+`bencher.bench_profiled(..)` returns a per-phase span breakdown plus the
+error-count delta. Outside divan: `bench::measure_breakdown(n, f)`.
 
 ## Debugging a failure as an agent
 
-1. Read the report block ([landing] renderer; today: the `Debug` tree plus
-   the `fast_observe.error` log line). The `action:` line will tell you the
-   next step.
+1. Read the report block [live: `render_report(&fault)` / the `Debug`
+   tree plus the `fast_observe.error` log line]. The `action:` line tells
+   you the next step.
 2. `grep` the trace_id in the logs for the full moment [live with
    `fastrace`: capture hook attaches it, `FastraceDiagnostic` stamps logs].
 3. `<bin> doctor <code>` [live: `fast_observe::doctor(code)`] for the
@@ -167,6 +209,15 @@ Default: `fastrace` + `bridge-log` [live]. Heavy deps are opt-in: `otel`
 (windows-only) are light. `instant`, `json`, `file`, `serde`,
 `metrics-facade`, `bridge-tracing` (tracing spans → fastrace), `http`
 (reqwest trace context) are tiny/light [all live]. `web` for wasm32
-(browser console + instant spans). `compat-anyhow`/`anyhow-boundary` at API
-boundaries: [landing]. `optick` was dropped (unmaintained upstream, broken
-on modern toolchains). Full table + weights + wasm notes: README.
+(browser console + instant spans). Also live: `backtrace` (capture hook),
+`flush-on-exit`, `bench`, `int-futures` (fastrace-futures re-export),
+`serde` (`render_report_json` + Diagnostic derives). `anyhow-boundary`
+[live: `compat::anyhow_boundary::{from_anyhow, into_anyhow}` — explicit
+`map_err` points, never implicit `From`]. `compat-eyre`
+(`compat::eyre_boundary`), `compat-error-stack`
+(`compat::error_stack_boundary` — typed context + frame stack survive),
+`int-tokio` (`tokio_ext::ObserveJoinExt::observe_join` — cancelled vs
+panic distinguished) [all live]. Caveat: `fastrace` forwards `fastrace/enable` — libraries must
+depend with `default-features = false` and let the binary enable fastrace.
+`optick` was dropped (unmaintained upstream, broken on modern toolchains).
+Full table + weights + wasm notes: README.

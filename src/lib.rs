@@ -18,6 +18,8 @@ pub mod exn;
 pub mod hook;
 pub mod profiling;
 pub mod report;
+#[cfg(feature = "int-tokio")]
+pub mod tokio_ext;
 
 #[cfg(feature = "fastrace")]
 pub mod reporter;
