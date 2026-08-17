@@ -1,0 +1,123 @@
+[package]
+name = "fast-observe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["evan"]
+license = "MIT OR Apache-2.0"
+description = "Error faults with causal trees + fastrace-first profiling/log orchestration"
+# TODO: set before publishing
+# repository = "https://github.com/<org>/fast-observe"
+keywords = ["error-handling", "profiling", "logging", "tracing", "observability"]
+categories = ["development-tools::debugging", "rust-patterns"]
+
+[features]
+default = ["fastrace", "bridge-log"]
+# Thread-local Instant span accumulator + timing breakdown (wasm-safe via web-time).
+instant = ["dep:humantime", "dep:nu-ansi-term"]
+# fastrace spans + logforth fastrace event appender + fastrace trace diagnostic.
+fastrace = [
+    "dep:fastrace",
+    "dep:logforth-append-fastrace",
+    "dep:logforth-diagnostic-fastrace",
+]
+# OpenTelemetry export (fastrace reporter + logforth appender crates re-exported).
+otel = ["fastrace", "dep:fastrace-opentelemetry", "dep:logforth-append-opentelemetry"]
+# JSON layout for the stdout appender.
+json = ["dep:logforth-layout-json"]
+# Rolling file appender (enabled in init() when OBSERVE_LOG_DIR is set).
+file = ["dep:logforth-append-file"]
+# Re-export the log ↔ logforth bridge for custom logger pipelines.
+bridge-log = ["logforth/bridge-log"]
+# Re-export fastrace-tracing (tracing spans → fastrace).
+bridge-tracing = ["fastrace", "dep:fastrace-tracing"]
+# Re-export fastrace-reqwest (trace context propagation over HTTP).
+http = ["fastrace", "dep:fastrace-reqwest"]
+# Web backend: instant spans + browser-console log appender (wasm32 only;
+# no-op appender on native targets).
+web = ["instant", "dep:wasm-bindgen", "dep:web-sys"]
+# Mirror error_counts through the `metrics` crate facade.
+metrics-facade = ["dep:metrics"]
+# serde Serialize/Deserialize for Diagnostic, Severity, SourceSpan.
+serde = ["dep:serde", "camino/serde1"]
+
+[dependencies]
+parking_lot = "0.12"
+log = { version = "0.4", features = ["kv"] }
+logforth = { version = "0.30", features = ["starter-log"] }
+documented = "0.10"
+strum = { version = "0.26", features = ["derive"] }
+derive_more = { version = "1.0", features = ["full"] }
+sealed = "0.6"
+camino = "1.2"
+fs-err = "3.3"
+profiling-procmacros = "1.0"
+ariadne = "0.6"
+web-time = "1.1"
+humantime = { version = "2.2", optional = true }
+nu-ansi-term = { version = "0.50", optional = true }
+fastrace = { version = "0.7", optional = true }
+logforth-append-fastrace = { version = "0.4", optional = true }
+logforth-diagnostic-fastrace = { version = "0.4", optional = true }
+fastrace-opentelemetry = { version = "0.18", optional = true }
+logforth-append-opentelemetry = { version = "0.4", optional = true }
+logforth-layout-json = { version = "0.4", optional = true }
+logforth-append-file = { version = "0.4", optional = true }
+fastrace-tracing = { version = "0.1", optional = true }
+fastrace-reqwest = { version = "0.3", optional = true }
+metrics = { version = "0.24", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+# Doctests/tests using define_errors! need linkme in scope (non-wasm).
+linkme = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", features = ["console"], optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+linkme = "0.3"
+
+[lints.rust]
+unsafe_code = "deny"
+unused_imports = "warn"
+unused_variables = "warn"
+dead_code = "warn"
+unconditional_recursion = "deny"
+redundant_semicolons = "deny"
+unused_must_use = "deny"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+variant_size_differences = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "deny"
+dbg_macro = "deny"
+
+# `let _ = mutex.lock()` unlocks instantly — always a bug.
+let_underscore_lock = "deny"
+# No new #[allow] without reason = "...".
+allow_attributes_without_reason = "warn"
+semicolon_if_nothing_returned = "warn"
+unnecessary_wraps = "warn"
+# .unwrap_or(f()) should be .unwrap_or_else(|| f()) for non-const fns.
+or_fun_call = "warn"
+# .clone() on refs / unnecessary clones.
+redundant_clone = "warn"
+# No silent type narrowing: prefer From/TryFrom over `as`.
+cast_lossless = "warn"
+# filter_map(|x| x.ok()) → flatten().
+manual_flatten = "warn"
+# let x = expr; x → expr.
+let_and_return = "warn"
+redundant_pub_crate = "warn"
+
+[package.metadata.docs.rs]
+all-features = true

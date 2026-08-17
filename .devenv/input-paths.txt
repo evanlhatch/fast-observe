@@ -1,0 +1,11 @@
+/home/evan/fast-observe/.devenv/bootstrap/bootstrapLib.nix
+/home/evan/fast-observe/.devenv/bootstrap/default.nix
+/home/evan/fast-observe/.devenv/bootstrap/resolve-lock.nix
+/home/evan/fast-observe/devenv/lang/rust.nix
+/home/evan/fast-observe/devenv.local.nix
+/home/evan/fast-observe/devenv.lock
+/home/evan/fast-observe/devenv.nix
+/home/evan/fast-observe/devenv.yaml
+/home/evan/.config/nixpkgs/overlays
+/home/evan/.config/nixpkgs/overlays.nix
+/home/evan/fast-observe/.env
