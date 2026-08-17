@@ -3,7 +3,10 @@
 //! 1. **`fastrace` feature** — fastrace replaces `tracing`.
 //! 2. **`instant` feature** — thread-local span accumulator that **coexists**
 //!    with other backends. Replaces HotProfile-style ad-hoc timers.
-//! 3. **Unified `scope!`** — one macro feeds the config-selected backend.
+//! 3. **Unified `scope!`** — one macro feeds the runtime-selected backend
+//!    SET (`config::Backends` mask). Tier-2 backends (puffin, tracy,
+//!    superluminal, tracing) are compiled in via `profile-with-*` features
+//!    and selected at runtime — compiled-in ≠ active.
 //! 4. **Automatic error context** — `profiling!()` sets a thread-local scope
 //!    name; the error path reads it and auto-attaches `Context::Scope(name)`.
 //! 5. **`finish_frame!`** — marks a tick/frame boundary in the instant backend.
@@ -19,30 +22,53 @@ pub(crate) mod clock;
 pub(crate) mod fastrace;
 #[cfg(feature = "instant")]
 pub mod instant;
+#[cfg(feature = "profile-with-puffin")]
+pub(crate) mod puffin;
+#[cfg(all(feature = "profile-with-superluminal", windows))]
+pub(crate) mod superluminal;
+#[cfg(feature = "profile-with-tracing")]
+pub(crate) mod tracing_scope;
+#[cfg(feature = "profile-with-tracy")]
+pub(crate) mod tracy;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub(crate) mod web;
 
 // ── Wrap modules: feature-gated re-exports + ZST stubs ─────────────────────
 
 macro_rules! profiling_backend {
-    ($wrap:ident, $backend:ident, $guard:ident, feat = $feat:literal $(, $finish_frame:ident)?) => {
+    (
+        // `enabled` is ONE parenthesized cfg predicate (a single token tree),
+        // e.g. `(feature = "profile-with-puffin")` or
+        // `(all(feature = "profile-with-superluminal", windows))`.
+        $wrap:ident, $backend:ident, $guard:ident, enabled = $enabled:tt
+        $(, finish_frame = $finish_frame:ident)?
+        $(, on_enable = $on_enable:ident)?
+        $(,)?
+    ) => {
         pub mod $wrap {
-            #[cfg(feature = $feat)]
-            pub use super::$backend::{dummy, enter, $($finish_frame,)? $guard};
-            #[cfg(not(feature = $feat))]
+            #[cfg $enabled]
+            pub use super::$backend::{dummy, enter, $($finish_frame,)? $($on_enable,)? $guard};
+            #[cfg(not $enabled)]
             pub struct $guard;
-            #[cfg(not(feature = $feat))]
+            #[cfg(not $enabled)]
             pub const fn enter<'a>(_name: &'a str, _tag: Option<&'a str>) -> $guard {
                 $guard
             }
-            #[cfg(not(feature = $feat))]
+            #[cfg(not $enabled)]
             pub const fn dummy() -> $guard {
                 $guard
             }
             $(
-            #[cfg(not(feature = $feat))]
+            #[cfg(not $enabled)]
             pub const fn $finish_frame() {}
             )?
+            $(
+            #[cfg(not $enabled)]
+            pub const fn $on_enable() {}
+            )?
+            /// `true` when this backend's cargo feature is compiled in (and
+            /// its target constraint, if any, matches the build target).
+            pub const AVAILABLE: bool = cfg! $enabled;
         }
     };
 }
@@ -51,80 +77,146 @@ profiling_backend!(
     instant_wrap,
     instant,
     InstantGuard,
-    feat = "instant",
-    finish_frame
+    enabled = (feature = "instant"),
+    finish_frame = finish_frame,
 );
 
-profiling_backend!(fastrace_wrap, fastrace, FastraceGuard, feat = "fastrace");
+profiling_backend!(
+    fastrace_wrap,
+    fastrace,
+    FastraceGuard,
+    enabled = (feature = "fastrace"),
+);
+
+profiling_backend!(
+    puffin_wrap,
+    puffin,
+    PuffinGuard,
+    enabled = (feature = "profile-with-puffin"),
+    finish_frame = finish_frame,
+    on_enable = on_enable,
+);
+
+profiling_backend!(
+    tracy_wrap,
+    tracy,
+    TracyGuard,
+    enabled = (feature = "profile-with-tracy"),
+);
+
+profiling_backend!(
+    superluminal_wrap,
+    superluminal,
+    SuperluminalGuard,
+    enabled = (all(feature = "profile-with-superluminal", windows)),
+);
+
+profiling_backend!(
+    tracing_wrap,
+    tracing_scope,
+    TracingGuard,
+    enabled = (feature = "profile-with-tracing"),
+);
 
 // ── Unified scope guard ────────────────────────────────────────────────────
 
-/// Guard returned by [`scope!`]. Holds the guards for all enabled backends.
+/// Guard returned by [`scope!`]. Holds one guard per backend; only backends
+/// whose bit is set in the runtime mask (and whose feature is compiled in)
+/// hold real guards — the rest are ZST stubs.
 /// Fields are never read — they exist purely for their Drop side effects.
 #[allow(dead_code, reason = "fields held only for Drop side effects")]
-pub struct ScopeGuard(instant_wrap::InstantGuard, fastrace_wrap::FastraceGuard);
+pub struct ScopeGuard {
+    instant: instant_wrap::InstantGuard,
+    fastrace: fastrace_wrap::FastraceGuard,
+    puffin: puffin_wrap::PuffinGuard,
+    tracy: tracy_wrap::TracyGuard,
+    superluminal: superluminal_wrap::SuperluminalGuard,
+    tracing: tracing_wrap::TracingGuard,
+}
 
 impl ScopeGuard {
-    /// Enter a scope for the config-selected backend only.
+    /// Enter a scope for every backend selected in the runtime mask.
     /// Zero allocation — the name is `'static` (a string literal).
+    /// Loads the mask ONCE; `Backends::OFF` → all-dummy guard (~2ns).
     ///
-    /// `Web` behaves like `Instant` for span timing; the browser-console half
+    /// `WEB` behaves like `INSTANT` for span timing; the browser-console half
     /// of the web backend is a log appender, not a span sink.
     #[must_use]
     pub fn new_static(name: &'static str, tag: Option<&'static str>) -> Self {
-        match crate::config::config().profiling_backend() {
-            crate::config::ProfilingBackend::Instant | crate::config::ProfilingBackend::Web => {
-                Self(instant_wrap::enter(name, tag), fastrace_wrap::dummy())
-            }
-            crate::config::ProfilingBackend::Fastrace => {
-                Self(instant_wrap::dummy(), fastrace_wrap::enter(name, tag))
-            }
-            crate::config::ProfilingBackend::Off => {
-                Self(instant_wrap::dummy(), fastrace_wrap::dummy())
-            }
+        use crate::config::Backends;
+        let mask = crate::config::config().backends();
+        Self {
+            instant: if mask.contains(Backends::INSTANT) || mask.contains(Backends::WEB) {
+                instant_wrap::enter(name, tag)
+            } else {
+                instant_wrap::dummy()
+            },
+            fastrace: if mask.contains(Backends::FASTRACE) {
+                fastrace_wrap::enter(name, tag)
+            } else {
+                fastrace_wrap::dummy()
+            },
+            puffin: if mask.contains(Backends::PUFFIN) {
+                puffin_wrap::enter(name, tag)
+            } else {
+                puffin_wrap::dummy()
+            },
+            tracy: if mask.contains(Backends::TRACY) {
+                tracy_wrap::enter(name, tag)
+            } else {
+                tracy_wrap::dummy()
+            },
+            superluminal: if mask.contains(Backends::SUPERLUMINAL) {
+                superluminal_wrap::enter(name, tag)
+            } else {
+                superluminal_wrap::dummy()
+            },
+            tracing: if mask.contains(Backends::TRACING) {
+                tracing_wrap::enter(name, tag)
+            } else {
+                tracing_wrap::dummy()
+            },
         }
     }
 
-    /// Enter a scope with a dynamic name. Leaks the string to satisfy `&'static str`.
-    /// Cold path — only called from dynamic scope creation (very rare).
-    /// The leak is bounded by the number of unique dynamic scopes (~50 bytes each).
+    /// Enter a scope with a dynamic name. Interns the string to satisfy
+    /// `&'static str` — repeated calls with the same name share one leaked
+    /// copy. Cold path — only called from dynamic scope creation (rare).
     #[must_use]
     pub fn new(name: &str, tag: Option<&str>) -> Self {
-        fn to_static(s: &str) -> &'static str {
-            Box::leak(s.to_owned().into_boxed_str())
-        }
-        Self::new_static(to_static(name), tag.map(to_static))
+        Self::new_static(intern(name), tag.map(intern))
     }
+}
+
+/// Intern a dynamic scope name: return the existing leaked copy if present,
+/// else leak once and insert. Bounded by the number of unique dynamic names
+/// (~50 bytes each).
+pub(crate) fn intern(s: &str) -> &'static str {
+    static INTERN: LazyLock<Mutex<HashSet<&'static str>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let mut set = INTERN.lock();
+    if let Some(&existing) = set.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
 }
 
 // ── The unified scope! macro ──────────────────────────────────────────────
 
-/// Create a profiling scope. Only constructs the guard for the config-selected backend.
-/// Returns `Option<ScopeGuard>` — `None` when profiling is Off.
-/// Zero-cost when `Off` (relaxed atomic load + predictable branch, ~2ns).
+/// Create a profiling scope. Evaluates to a `ScopeGuard` holding one guard
+/// per runtime-selected backend.
+/// Zero-cost when the mask is `OFF`: one relaxed atomic load inside
+/// `ScopeGuard::new_static` + all-dummy guards (~2ns).
 #[macro_export]
 macro_rules! scope {
     ($name:expr) => {{
-        let _guard = if $crate::config::config().profiling_backend()
-            != $crate::config::ProfilingBackend::Off
-        {
-            Some($crate::profiling::ScopeGuard::new_static($name, None))
-        } else {
-            None
-        };
+        let _guard = $crate::profiling::ScopeGuard::new_static($name, None);
         _guard
     }};
     ($name:expr, $tag:expr) => {{
-        let _guard = if $crate::config::config().profiling_backend()
-            != $crate::config::ProfilingBackend::Off
-        {
-            Some($crate::profiling::ScopeGuard::new_static(
-                $name,
-                Some($tag.as_ref()),
-            ))
-        } else {
-            None
-        };
+        let _guard = $crate::profiling::ScopeGuard::new_static($name, Some($tag.as_ref()));
         _guard
     }};
 }
@@ -168,22 +260,32 @@ macro_rules! function_scope {
     };
 }
 
+/// Mark a tick/frame boundary: `INSTANT`/`WEB` advance the instant
+/// accumulator's frame counter; `PUFFIN` calls `puffin`'s per-frame hook
+/// (upstream `profiling::finish_frame!` semantics).
 #[macro_export]
 macro_rules! finish_frame {
-    () => {
-        if matches!(
-            $crate::config::config().profiling_backend(),
-            $crate::config::ProfilingBackend::Instant | $crate::config::ProfilingBackend::Web
-        ) {
+    () => {{
+        let mask = $crate::config::config().backends();
+        if mask.contains($crate::config::Backends::INSTANT)
+            || mask.contains($crate::config::Backends::WEB)
+        {
             $crate::profiling::instant_wrap::finish_frame();
         }
-    };
+        if mask.contains($crate::config::Backends::PUFFIN) {
+            $crate::profiling::puffin_wrap::finish_frame();
+        }
+    }};
 }
 
 // ── Function scope tracking (for automatic error context) ─────────────────
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
+use parking_lot::Mutex;
 // web_time, not std: `std::time::Instant::now` panics on wasm32-unknown-unknown.
 use web_time::Instant;
 
@@ -272,4 +374,20 @@ pub fn current_scope_elapsed_ms() -> Option<u128> {
 // ── Re-export the proc macros ─────────────────────────────────────────────
 
 pub use profiling_procmacros::all_functions;
+pub use profiling_procmacros::function;
 pub use profiling_procmacros::skip;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn intern_dedups_dynamic_names() {
+        let a = super::intern("same_name");
+        let b = super::intern("same_name");
+        assert!(
+            std::ptr::eq(a, b),
+            "same input must return the same pointer"
+        );
+        let c = super::intern("other_name");
+        assert!(!std::ptr::eq(a, c), "different inputs must not alias");
+    }
+}

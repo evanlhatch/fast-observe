@@ -12,6 +12,7 @@ use core::ops::Deref;
 use core::panic::Location;
 use parking_lot::Mutex;
 use sealed::sealed;
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -97,6 +98,73 @@ impl Context {
     }
 }
 
+// ── Attachments — typed, inspectable data on frames ───────────────────────
+
+/// Where an attachment appears when a fault tree is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// In the tree, under the frame. Default.
+    #[default]
+    Inline,
+    /// Deferred to an appendix section (large payloads).
+    Appendix,
+    /// Counted but not shown (secrets).
+    Opaque,
+    /// Not shown, not counted. Programmatic only.
+    Hidden,
+}
+
+/// A typed attachment on a [`Frame`]: cached display string + typed value
+/// for programmatic inspection (`downcast`).
+pub struct Attachment {
+    key: Option<&'static str>,
+    display: String,
+    value: Arc<dyn Any + Send + Sync>,
+    placement: Placement,
+}
+
+impl Attachment {
+    /// The attachment's key, when it was attached with one.
+    #[must_use]
+    pub fn key(&self) -> Option<&'static str> {
+        self.key
+    }
+    /// The display string, computed once at attach time.
+    #[must_use]
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+    /// Where this attachment appears when the fault tree is rendered.
+    #[must_use]
+    pub fn placement(&self) -> Placement {
+        self.placement
+    }
+    /// The typed value, if the caller knows what was attached.
+    #[must_use]
+    pub fn downcast<T: 'static>(&self) -> Option<&T> {
+        self.value.downcast_ref::<T>()
+    }
+}
+
+impl fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Attachment")
+            .field("key", &self.key)
+            .field("display", &self.display)
+            .field("placement", &self.placement)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for Attachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.key {
+            Some(key) => write!(f, "{key}: {}", self.display),
+            None => f.write_str(&self.display),
+        }
+    }
+}
+
 // ── Frame — one node in the causal tree ────────────────────────────────────
 
 /// A frame in the fault causal tree.
@@ -113,6 +181,7 @@ pub struct Frame {
     pub(crate) context: Context,
     pub(crate) children: Vec<Arc<Frame>>,
     pub(crate) type_name: &'static str,
+    pub(crate) attachments: Vec<Attachment>,
 }
 
 impl Frame {
@@ -133,6 +202,7 @@ impl Frame {
             context,
             children,
             type_name,
+            attachments: Vec::new(),
         });
         crate::hook::invoke(&frame);
         frame
@@ -162,6 +232,16 @@ impl Frame {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         self.type_name
+    }
+    /// Typed attachments on this frame, in attach order.
+    #[must_use]
+    pub fn attachments(&self) -> &[Attachment] {
+        &self.attachments
+    }
+    /// The first attached value of type `T` (linear scan + downcast).
+    #[must_use]
+    pub fn find_attachment<T: 'static>(&self) -> Option<&T> {
+        self.attachments.iter().find_map(Attachment::downcast::<T>)
     }
 
     /// Pre-order iterator over this frame and all descendants (self first,
@@ -211,6 +291,7 @@ fn frame_from_error(
         context: Context::None,
         children,
         type_name,
+        attachments: Vec::new(),
     })
 }
 
@@ -351,6 +432,64 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
         self
     }
 
+    /// Attach debugging data (rendered inline under the root frame).
+    ///
+    /// The display string is computed once, here; the typed value stays
+    /// reachable via [`Fault::find_attachment`]. Same unique-root rule as
+    /// [`Fault::with_context`].
+    pub fn attach<A: fmt::Display + Send + Sync + 'static>(self, value: A) -> Self {
+        self.attach_inner(None, value, Placement::Inline)
+    }
+
+    /// Attach debugging data with a key (rendered `key: value`).
+    pub fn attach_key<A: fmt::Display + Send + Sync + 'static>(
+        self,
+        key: &'static str,
+        value: A,
+    ) -> Self {
+        self.attach_inner(Some(key), value, Placement::Inline)
+    }
+
+    /// Attach debugging data with explicit [`Placement`].
+    pub fn attach_placed<A: fmt::Display + Send + Sync + 'static>(
+        self,
+        value: A,
+        placement: Placement,
+    ) -> Self {
+        self.attach_inner(None, value, placement)
+    }
+
+    /// The single attachment mutation path — see [`Fault::with_context`]
+    /// for the shared-root rule.
+    fn attach_inner<A: fmt::Display + Send + Sync + 'static>(
+        mut self,
+        key: Option<&'static str>,
+        value: A,
+        placement: Placement,
+    ) -> Self {
+        let attachment = Attachment {
+            key,
+            display: value.to_string(),
+            value: Arc::new(value),
+            placement,
+        };
+        if let Some(frame) = Arc::get_mut(&mut self.root) {
+            frame.attachments.push(attachment);
+        } else {
+            debug_assert!(
+                Arc::strong_count(&self.root) == 1,
+                "attach on a shared Fault root — attachment would be lost"
+            );
+        }
+        self
+    }
+
+    /// The root frame's typed attachment lookup.
+    #[must_use]
+    pub fn find_attachment<T: 'static>(&self) -> Option<&T> {
+        self.root.find_attachment::<T>()
+    }
+
     /// The current context on the root frame.
     #[must_use]
     pub fn context(&self) -> &Context {
@@ -477,6 +616,31 @@ pub trait ResultExt {
         msg: impl Into<Cow<'static, str>>,
     ) -> core::result::Result<Self::Success, Fault<Self::Error>>;
 
+    /// Attach debugging data when Err. On Ok the value passes through untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Fault<Self::Error>)` carrying the attachment on the root
+    /// frame when `self` is `Err`.
+    #[track_caller]
+    fn attach<A: fmt::Display + Send + Sync + 'static>(
+        self,
+        value: A,
+    ) -> Result<Self::Success, Self::Error>;
+
+    /// Lazy form of [`ResultExt::attach`] — the closure runs ONLY on Err
+    /// (Ok pays nothing).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Fault<Self::Error>)` carrying the attachment on the root
+    /// frame when `self` is `Err`.
+    #[track_caller]
+    fn attach_with<A: fmt::Display + Send + Sync + 'static>(
+        self,
+        f: impl FnOnce() -> A,
+    ) -> Result<Self::Success, Self::Error>;
+
     /// The one blessed swallow: report the error and continue with `None`.
     ///
     /// The error hook already fired at construction (the error is logged once,
@@ -549,6 +713,27 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
                 }
                 Err(fault)
             }
+        }
+    }
+
+    #[track_caller]
+    #[cold]
+    fn attach<A: fmt::Display + Send + Sync + 'static>(self, value: A) -> Result<T, E> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(e) => Err(Fault::new(e).attach(value)),
+        }
+    }
+
+    #[track_caller]
+    #[cold]
+    fn attach_with<A: fmt::Display + Send + Sync + 'static>(
+        self,
+        f: impl FnOnce() -> A,
+    ) -> Result<T, E> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(e) => Err(Fault::new(e).attach(f())),
         }
     }
 
@@ -667,6 +852,7 @@ fn walk_sources(error: &dyn Error, location: &'static Location<'static>) -> Vec<
             context: Context::None,
             children,
             type_name,
+            attachments: Vec::new(),
         })];
     }
     children
@@ -678,6 +864,13 @@ impl<E: Send + Sync + Sized + 'static> fmt::Debug for Fault<E> {
     }
 }
 
+/// Render the fault tree: one line per frame (`error, at file:line:col
+/// [context]`), children nested under `|-- `/``-- `` connectors. Inline
+/// attachments render as leading pseudo-children (`* {display}` lines)
+/// BEFORE real children, sharing the sibling last-ness — the last line under
+/// a frame (attachment or child) gets ``-- ``, the rest `|-- `. Non-inline
+/// attachments are not rendered in-tree; the frame's own line gets a
+/// ` (+N more attachments)` suffix when N > 0.
 fn write_fault(f: &mut fmt::Formatter<'_>, frame: &Frame, prefix: &str) -> fmt::Result {
     write!(f, "{}", frame.error)?;
     let loc = frame.location;
@@ -685,8 +878,33 @@ fn write_fault(f: &mut fmt::Formatter<'_>, frame: &Frame, prefix: &str) -> fmt::
     if !matches!(frame.context, Context::None) {
         write!(f, " [{}]", frame.context)?;
     }
+    let inline_count = frame
+        .attachments
+        .iter()
+        .filter(|a| a.placement == Placement::Inline)
+        .count();
+    let deferred = frame.attachments.len() - inline_count;
+    if deferred > 0 {
+        write!(f, " (+{deferred} more attachments)")?;
+    }
+    // Inline attachments are leading pseudo-children: they share the
+    // sibling last-ness with real children.
+    let total = inline_count + frame.children.len();
+    for (i, attachment) in frame
+        .attachments
+        .iter()
+        .filter(|a| a.placement == Placement::Inline)
+        .enumerate()
+    {
+        if i + 1 == total {
+            write!(f, "\n{prefix}`-- ")?;
+        } else {
+            write!(f, "\n{prefix}|-- ")?;
+        }
+        write!(f, "* {attachment}")?;
+    }
     for (i, child) in frame.children.iter().enumerate() {
-        let last = i == frame.children.len() - 1;
+        let last = inline_count + i + 1 == total;
         let next_prefix = if last {
             write!(f, "\n{prefix}`-- ")?;
             format!("{prefix}    ")

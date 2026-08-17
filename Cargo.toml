@@ -38,6 +38,14 @@ http = ["fastrace", "dep:fastrace-reqwest"]
 web = ["instant", "dep:wasm-bindgen", "dep:web-sys"]
 # Mirror error_counts through the `metrics` crate facade.
 metrics-facade = ["dep:metrics"]
+# Tier-2 profiler: puffin (compiled in, runtime-selected via `Backends::PUFFIN`).
+profile-with-puffin = ["dep:puffin"]
+# Tier-2 profiler: tracy (compiled in, runtime-selected via `Backends::TRACY`).
+profile-with-tracy = ["dep:tracy-client"]
+# Tier-2 profiler: tracing spans (compiled in, runtime-selected via `Backends::TRACING`).
+profile-with-tracing = ["dep:tracing"]
+# Tier-2 profiler: superluminal (windows-only, runtime-selected via `Backends::SUPERLUMINAL`).
+profile-with-superluminal = ["dep:superluminal-perf"]
 # serde Serialize/Deserialize for Diagnostic, Severity, SourceSpan.
 serde = ["dep:serde", "camino/serde1"]
 
@@ -66,6 +74,9 @@ logforth-append-file = { version = "0.4", optional = true }
 fastrace-tracing = { version = "0.1", optional = true }
 fastrace-reqwest = { version = "0.3", optional = true }
 metrics = { version = "0.24", optional = true }
+puffin = { version = "0.20", optional = true }
+tracy-client = { version = "0.18", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 
 [dev-dependencies]
@@ -79,6 +90,9 @@ web-sys = { version = "0.3", features = ["console"], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 linkme = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+superluminal-perf = { version = "0.4", optional = true }
 
 [lints.rust]
 missing_docs = "warn"

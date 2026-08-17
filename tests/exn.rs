@@ -5,7 +5,7 @@
 use core::fmt;
 use std::error::Error;
 
-use fast_observe::exn::{Context, Fault, OptionExt, Result, ResultExt};
+use fast_observe::exn::{Context, Fault, OptionExt, Placement, Result, ResultExt};
 use fast_observe::{ErrorCategory, bail};
 
 // ── Context Display stability — these strings appear in logs and crash
@@ -226,4 +226,105 @@ fn root_cause_is_deepest_first_branch() {
 
     let single = Fault::new(chain(&["only"]));
     assert_eq!(single.root_cause().error().to_string(), "only");
+}
+
+// ── Attachments: typed data on frames ───────────────────────────────
+
+#[test]
+fn attach_and_downcast_roundtrip() {
+    let f = Fault::new(TestErr)
+        .attach_key("attempt", 3u32)
+        .attach(String::from("payload"));
+    assert_eq!(f.find_attachment::<u32>(), Some(&3));
+    let atts = f.frame().attachments();
+    assert_eq!(atts.len(), 2);
+    assert_eq!(atts[0].key(), Some("attempt"));
+    assert_eq!(atts[0].display(), "3");
+    assert_eq!(atts[0].placement(), Placement::Inline);
+    assert_eq!(atts[0].to_string(), "attempt: 3");
+    assert_eq!(atts[1].key(), None);
+    assert_eq!(atts[1].display(), "payload");
+    assert_eq!(atts[1].to_string(), "payload");
+    assert_eq!(
+        f.frame().find_attachment::<String>().map(String::as_str),
+        Some("payload")
+    );
+}
+
+#[test]
+fn attach_with_lazy_on_ok() {
+    use std::cell::Cell;
+    let flag = Cell::new(false);
+
+    let ok: core::result::Result<u32, TestErr> = Ok(7);
+    let v = ok
+        .attach_with(|| {
+            flag.set(true);
+            1u32
+        })
+        .unwrap();
+    assert_eq!(v, 7);
+    assert!(!flag.get(), "closure must not run on Ok");
+
+    let err: core::result::Result<u32, TestErr> = Err(TestErr);
+    let e = err
+        .attach_with(|| {
+            flag.set(true);
+            42u32
+        })
+        .unwrap_err();
+    assert!(flag.get(), "closure runs on Err");
+    assert_eq!(e.find_attachment::<u32>(), Some(&42));
+}
+
+#[test]
+fn attachments_render_in_debug_tree() {
+    let f = Fault::new(TestErr)
+        .attach_key("attempt", 3u32)
+        .attach_placed("secret-token", Placement::Hidden);
+    let dbg = format!("{f:?}");
+    // Only attachment: it is the last pseudo-child → ``-- `.
+    assert!(dbg.contains("`-- * attempt: 3"), "inline attachment: {dbg}");
+    assert!(
+        dbg.contains(" (+1 more attachments)"),
+        "hidden attachment counted on frame line: {dbg}"
+    );
+    assert!(
+        !dbg.contains("secret-token"),
+        "hidden value must not render: {dbg}"
+    );
+}
+
+#[test]
+fn non_last_frame_attachments_use_continuation() {
+    // Attached frames always land as the LAST sibling (attach mutates the
+    // root pre-wrap, wrap pushes it last), so the continuation bar `|   `
+    // shows on the NON-last sibling's subtree, and the attachment is the
+    // non-last PSEUDO-child of its own frame (before the real child).
+    // Tree shape:
+    //   capA
+    //   |-- topA
+    //   |   `-- midA
+    //   |       `-- leafA
+    //   `-- outerB (+1 more attachments would appear if non-inline)
+    //       |-- * attempt: 3        <- non-last pseudo-child: `|-- `
+    //       `-- midB                <- real child is last: ``-- `
+    //           `-- leafB
+    let b = Fault::new(chain(&["outerB", "midB", "leafB"])).attach_key("attempt", 3u32);
+    let big = b.wrap(chain(&["capA", "topA", "midA", "leafA"]));
+    let dbg = format!("{big:?}");
+    assert!(dbg.contains("|-- topA"), "first sibling: {dbg}");
+    assert!(
+        dbg.contains("|   `-- midA"),
+        "non-last sibling's child keeps continuation bar: {dbg}"
+    );
+    assert!(dbg.contains("`-- outerB"), "last sibling: {dbg}");
+    assert!(
+        dbg.contains("    |-- * attempt: 3"),
+        "attachment is non-last pseudo-child under outerB: {dbg}"
+    );
+    assert!(
+        dbg.contains("    `-- midB"),
+        "real child after attachment is last: {dbg}"
+    );
 }

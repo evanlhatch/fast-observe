@@ -47,14 +47,11 @@ optional; env vars are overrides, not requirements.
 ```rust
 use fast_observe::prelude::*;
 
-// ── Presets (the 90%) ────────────────────────────────────────────────
-fast_observe::observe().dev()?;    // pretty stdout, OBSERVE_LOG default "debug",
-                                   // console traces, backtraces on, hooks unthrottled
-fast_observe::observe().prod()?;   // json stdout + rolling file (OBSERVE_LOG_DIR),
-                                   // otel traces if endpoint set, throttle 100/s/type
-fast_observe::observe().test()?;   // captured records (testing appender), instant
-                                   // spans, deterministic output — for assertions
-fast_observe::observe().wasm()?;   // instant spans + browser console
+// NO environment presets (dev/prod/test) — rejected design: they bundle
+// opinionated choices and hide the toggles. Everything is granular:
+// each capability is one builder toggle with a documented default, so the
+// type surface IS the documentation and nothing is hardcoded.
+// Zero-config `fast_observe::init()` stays for the default-on path.
 
 // ── Full control (bon builder; .build() validates) ───────────────────
 let deployment = fast_observe::observe()
@@ -64,7 +61,7 @@ let deployment = fast_observe::observe()
     .file_from_env()                            // rolling file when OBSERVE_LOG_DIR set
     .otel_logs(log_exporter)                    // caller builds exporter (SDK config is app's)
     .traces(Traces::Console)                    // Traces::{Console,Off} or .otel_reporter(r)
-    .profiling(Profiling::Fastrace)             // Tier-1 runtime backend
+    .backends(Backends::FASTRACE | Backends::TRACY)  // runtime-selected set; compiled-in ≠ active
     .error_hooks(|h| h.throttle_per_type(100).backtrace(true))
     .appender(my_custom_append)                 // escape hatch: any logforth Append
     .build();                                   // type-checked, env applied, returns Deployment
@@ -185,15 +182,15 @@ LLM-surface rules (the `profiling` crate is in training data; exploit it):
 1. Macro names AND call shapes stay byte-identical to upstream —
    `scope!("literal")`, `scope!("literal", "tag")` — so LLM-generated
    instrumentation compiles without correction. Literal-first, always.
-2. Re-export the upstream `profiling` crate itself under any Tier-2
-   feature (`pub use profiling;`): an agent writing `profiling::scope!`
-   or `profiling::finish_frame!()` directly still works.
-3. Feature names verbatim `profile-with-*` — agents guess them
+2. Feature names verbatim `profile-with-*` — agents guess them
    correctly from upstream knowledge.
-4. The ONE semantic difference must be loud in README/docs: upstream is
-   one-backend-at-a-time; ours is additive (Tier-2 compile-time backends
-   PLUS the runtime-selected Tier-1). Agents WILL assume upstream's rule.
-5. All of it lands in `prelude` — one glob import = the whole familiar
+3. The ONE semantic difference must be loud in README/docs: upstream is
+   compile-time one-backend-at-a-time; ours compiles any set in and
+   SELECTS AT RUNTIME (`Backends` bitmask, `OBSERVE_PROFILE=fastrace,tracy`).
+   Compiled-in ≠ active. Agents WILL assume upstream's rule — and setting
+   an uncompiled backend logs a warning naming the feature to enable, so
+   the correction is self-teaching.
+4. All of it lands in `prelude` — one glob import = the whole familiar
    vocabulary.
 
 ---
@@ -321,6 +318,33 @@ category, policy, canonical display, advice, defining crate. flatlandc's
 hand-rolled 35-line subcommand becomes `print!("{}", doctor(&code)?)`.
 
 ---
+
+## 5b. The canonical surface — five items, three ontologies
+
+The primitives are ontological, not historical: POINTS (log macros),
+INTERVALS (`scope!`), VALUES (`bail!`/`ensure!` — errors are returned,
+not emitted). Collapsing any pair is a category error (interval as two
+points loses nesting; error as event loses the type). So the surface
+condenses to exactly:
+
+1. **`log` macros** — ALL point events. No fast-observe logging API
+   exists. `log::info!(user_id = 42; "msg")` — kv flows through logforth
+   into span events automatically (fastrace's design: the log crate is
+   the facade, deliberately no logging macros in fastrace itself).
+2. **`scope!("phase.op")`** — intervals. (profiling!/function_scope!
+   FOLD INTO #[instrument] — the tracing reflex; ours delegates to
+   #[fastrace::trace] for async-correctness + pushes the scope stack.)
+3. **`bail!` / `ensure!`** — error values. bail! IS the log statement:
+   construct + count + span event + log in one verb. Double-reporting
+   (`log::error!` then `return Err`) is an anti-pattern the vendored
+   AGENTS.md snippet calls out by name.
+4. **`#[instrument]` / `#[all_functions]`** — zero-effort propagation
+   (shift-left: one attribute instruments a whole impl block).
+5. **`error!`** — typed error definitions (codes/categories enforced at
+   authoring time = policy shift-left).
+
+Everything else is methods (`.context()`, `.attach()`, `.report()`) and
+configuration. A user who knows only `log` + `bail!` gets full value.
 
 ## 6. Isomorphism: four unifiers, one vocabulary
 

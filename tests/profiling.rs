@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use fast_observe::config::ProfilingBackend;
+use fast_observe::config::Backends;
 use fast_observe::profiling::{
     ScopeGuard, current_scope_elapsed_ms, current_scope_name, enter_function_scope,
     enter_function_scope_with_tag, scope_path,
@@ -31,33 +31,41 @@ fn function_scope_with_tag_appends() {
 
 #[test]
 fn scope_guard_static_constructs() {
-    // The unified guard must construct for every backend without panic.
+    // The unified guard must construct for every backend set without panic.
     let cfg = fast_observe::config::config();
-    let original = cfg.profiling_backend();
-    for backend in [
-        ProfilingBackend::Off,
-        ProfilingBackend::Instant,
-        ProfilingBackend::Fastrace,
-        ProfilingBackend::Web,
+    let original = cfg.backends();
+    let all = Backends::INSTANT
+        | Backends::FASTRACE
+        | Backends::WEB
+        | Backends::PUFFIN
+        | Backends::TRACY
+        | Backends::SUPERLUMINAL
+        | Backends::TRACING;
+    for combo in [
+        Backends::OFF,
+        Backends::INSTANT,
+        Backends::FASTRACE,
+        Backends::FASTRACE | Backends::PUFFIN,
+        all,
     ] {
-        cfg.set_profiling_backend(backend);
+        cfg.set_backends(combo);
         drop(ScopeGuard::new_static("test_scope", None));
     }
-    cfg.set_profiling_backend(original);
+    cfg.set_backends(original);
 }
 
 #[cfg(feature = "instant")]
 #[test]
 fn scope_macro_records_with_instant_backend() {
     let cfg = fast_observe::config::config();
-    let original = cfg.profiling_backend();
-    cfg.set_profiling_backend(ProfilingBackend::Instant);
+    let original = cfg.backends();
+    cfg.set_backends(Backends::INSTANT);
     fast_observe::profiling::instant::clear();
     {
         let _g = fast_observe::scope!("macro_scope");
     }
     let spans = fast_observe::drain_spans();
-    cfg.set_profiling_backend(original);
+    cfg.set_backends(original);
     assert!(
         spans.iter().any(|s| s.name == "macro_scope"),
         "scope! must record to the instant backend when selected: {spans:?}"

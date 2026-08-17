@@ -89,35 +89,52 @@ Fixes folded in:
     one clock source + calibration, so durations are directly comparable
     across the two Tier-1 backends (the isomorphism rule applied to time).
 
-### Tier 2 — compile-time (new): forward to upstream `profiling`
+### Tier 2 — runtime-selectable backend SET (REVISED; no upstream `profiling` dep)
 
-Add optional dep on the `profiling` crate and re-expose its backend
-features verbatim:
+Original plan forwarded to the upstream `profiling` crate. REJECTED:
+upstream's model is compile-time-only (feature on = always instrumenting),
+and the design decision here is that **compiled-in ≠ active** — backends
+are compiled in via features and SELECTED at runtime via flags, alongside
+Tier-1. (User directive: "no profiles; just selecting what you want and
+having flags/toggles. Default is fastrace; you turn instant on to look at
+performance.")
+
+Instead we own ~15-line glue modules per backend (upstream `profiling` is
+the reference implementation — same APIs, same semantics), each behind
+`profile-with-*` features named verbatim after upstream:
 
 ```toml
-profile-with-puffin       = ["profiling/profile-with-puffin"]
-profile-with-optick       = ["profiling/profile-with-optick"]
-profile-with-tracy        = ["profiling/profile-with-tracy"]
-profile-with-superluminal = ["profiling/profile-with-superluminal"]
-profile-with-tracing      = ["profiling/profile-with-tracing"]
-profiling = { version = "1", optional = true, default-features = false }
+profile-with-puffin       = ["dep:puffin"]
+profile-with-tracy        = ["dep:tracy-client"]
+profile-with-optick       = ["dep:optick"]
+profile-with-superluminal = ["dep:superluminal-perf"]  # windows-only dep
+profile-with-tracing      = ["dep:tracing"]            # our scope! → tracing::span
 ```
 
-`scope!` expands to BOTH: `profiling::scope!($name ...)` as a statement
-(its own internal guard binding; expands to nothing with no Tier-2 feature)
-plus the Tier-1 `Option<ScopeGuard>`. Consequences:
+Runtime selection replaces `ProfilingBackend` with a bitmask:
 
-- No Tier-2 feature → macro expands to exactly today's code. Zero cost.
-- Tier-2 on + Tier-1 Off → profiler still records (compile-time opt-in
-  semantics, identical to upstream docs — no surprise).
-- Tier-2 on + Tier-1 Fastrace → both record. Not a bug: tracy gives the
-  frame profiler UI, fastrace gives structured trace export. Document.
+```rust
+pub struct Backends(u16);   // INSTANT | FASTRACE | WEB | PUFFIN | TRACY | OPTICK | SUPERLUMINAL | TRACING
+config().set_backends(Backends::FASTRACE | Backends::TRACY);
+```
+
+- `scope!` = ONE atomic load of the mask; each enabled+compiled backend
+  enters its guard (ZST stubs when not compiled — the existing
+  `profiling_backend!` wrap-module pattern extended per backend).
+  Mask 0 → all-dummy guard, ~2ns.
+- `OBSERVE_PROFILE` becomes a comma list (`fastrace,tracy`); single names
+  (`off|instant|fastrace|web`) keep working.
+- **Self-teaching config**: setting a bit whose feature is not compiled
+  logs a one-time warning naming the exact cargo feature to enable
+  (`profile-with-tracy`). LLM agents reading the log learn the flag.
+- Backend enable hooks: puffin needs `set_scopes_on(true)` —
+  `set_backends` calls per-backend `on_enable()` when a bit flips on.
+- Dependency weight is the whole point of features (see §9d): tracy/optick
+  compile C/C++, otel pulls the OTel SDK tree — none of it exists in the
+  build unless its feature is named.
 
 Also re-export from `profiling-procmacros`: `function` (currently missing —
-only `all_functions`/`skip` are re-exported), and upstream
-`profiling::register_thread!` / `finish_frame!` behavior documented against
-our `finish_frame!` (ours currently only feeds the instant backend; extend
-to call `profiling::finish_frame!` too).
+only `all_functions`/`skip` are re-exported).
 
 ### Async gap (must close for "ultimate")
 
@@ -695,6 +712,79 @@ the explicit-boundary philosophy (never implicit From).
     assets, DESIGN/SURFACE docs decisions, tests kept or dropped
     deliberately (cargo package output is user-facing).
 
+## 9c-ext. Extension points + direct-vs-handroll (post-ecosystem scan)
+
+Verified live bug first: `profiling-procmacros` expands to
+`profiling::function_scope!()` / `profiling::tracing::span!(...)` — paths
+into the `profiling` crate we do NOT depend on. Our re-exported
+`all_functions`/`skip` are UNCOMPILABLE for consumers without a separate
+`profiling` dep. Fix lands in stage 5: own macros in fast-observe-macros
+(expand to `$crate` paths, push our scope stack, delegate to
+`#[fastrace::trace]` when enabled — async-correct via `enter_on_poll`).
+
+Extension-point adoptions (no forks; all public APIs):
+
+- fastrace `Event::add_to_local_parent` at Fault capture (errors as span
+  events; OTel exception events on export); `Reporter` trait →
+  `SamplingReporter` (traces with error events always kept, successes
+  sampled) + `MultiReporter` (console+OTel fan-out); `LocalCollector` for
+  test span assertions; builder takes `collector::Config`.
+- logforth: `core::builder()` multi-dispatch for Deployment (starter_log
+  stays for init()); `Append/Layout/Filter/Diagnostic` as typed escape
+  hatches; `append::Testing` for tests. **log `kv` feature is already
+  enabled but unused** — default hook logs `error.code`/`error.category`/
+  `error.location`/`trace.id` as structured kv so JsonLayout/OTel emit
+  fields, not strings.
+- exn convergence: `impl Error for Frame` with `source()` → first child;
+  `Fault::source` likewise — the causal tree becomes traversable by
+  std-protocol tooling (anyhow chain walker, sources(), error-stack).
+- rootcause convergence: `IteratorExt`-style `.collect::<FaultCollection>()`.
+- std/nightly: `Termination` (free), `backtrace_frames`, `error!`-generated
+  `Error::provide` (code/category/location/backtrace through `&dyn Error`).
+- divan: re-export via its `crate =` macro option + `bench_profiled` +
+  versioned JSON baselines (agent-diffable benchmark records).
+
+Direct vs handroll: REPLACE profiling-procmacros (above); keep our 6-line
+`func_path!`; clock collapses to fastant/web-time cfg alias; throttle +
+intern table stay hand-rolled (~60 lines total; governor et al. overkill);
+instant accumulator stays (works fastrace-free); compat layers hand-rolled
+small with deps only on their targets; `error!` via venial proc macro.
+
+## 9d. Dependency weight budget + divan
+
+### Weight audit (what a feature costs a consumer)
+
+| feature | weight | why |
+|---|---|---|
+| `fastrace`, `bridge-log` (default) | light | fastrace (fastant + small vec types), logforth core |
+| `instant`, layouts, `log-file`/`syslog`/`journald`/`async`, `filter-rustlog`, diagnostics | tiny | single-purpose crates |
+| `profile-with-puffin` / `-tracing` | light-medium | pure Rust |
+| `profile-with-tracy` / `-optick` | heavy BUILD | C/C++ compiled via build scripts |
+| `otel` | heavy TREE | opentelemetry SDK + otlp dependency tree |
+| `superluminal` | tiny, windows-only | FFI bindings |
+| divan / bolero / insta / trybuild | dev-deps only | never in consumer builds |
+
+Rule: every non-default capability is `dep:`-optional; README carries this
+table; CI spot-checks `cargo tree --no-default-features` stays minimal.
+
+### Divan (feature `bench`)
+
+Divan's `Counter` set is closed (BytesCount/ItemsCount) and it has no
+timing-source plugin API — spans cannot become divan columns. What folds
+in sanely:
+
+1. **Re-export** (`pub use divan;`): `#[fast_observe::bench]`, `Bencher`,
+   `black_box` — benches need no separate dev-dep juggling.
+2. **`BenchExt::bench_profiled(|| ...)`**: forces the instant backend on
+   for the measured closure; after divan's stats, emits the per-phase
+   span breakdown (print_breakdown data, per-iteration totals). divan
+   answers "how fast", the breakdown answers "where". Overhead of the
+   scope instrumentation is INCLUDED in profiled numbers — documented:
+   plain `bench` (backend Off) for absolute numbers, `bench_profiled`
+   for attribution.
+3. **Error counters**: `error_counts` delta across the bench →
+   `ItemsCount` ("errors/sec" on error-path benches).
+
 ## 10. Migration + rollout (jj stages, each independently green)
 
 1. `fix`: tree-prefix connectors, `wrap_msg` source walk, scope stack
@@ -818,6 +908,25 @@ web-time clock. Audit of everything the overhaul adds:
 | env vars | `env::var` returns Err on wasm → defaults apply (already the pattern). NEVER `set_var` outside native tests |
 | sysexits / `main() -> Result` | compiles; exit codes are WASI-meaningful, browser-no-op. Fine |
 | breadcrumbs / scope stack / FaultCollection / attachments | pure data structures — fine |
+
+**W3C / WASI / WIT additions (cutting-edge wasm deployments):**
+
+- `trace_context` helpers on top of fastrace's `W3CTraceContext`:
+  `extract(&headers) -> SpanContext` / `inject(ctx) -> String`, and
+  `root_span!` gains a continuation form `root_span!("name", ctx)`.
+  Covers wasi-http handlers, axum, manual propagation.
+- Component-model boundary rule (documented pattern): TLS scope stacks
+  do not cross host-task lifts — extract ctx at the WIT boundary, root a
+  new span on entry, inject on outbound. Context as VALUES at
+  boundaries, TLS inside.
+- `web` extension: instant-backend spans also emit
+  `performance.mark()/measure()` via web-sys — `scope!` regions appear
+  in the browser devtools timeline. Nothing else in Rust wasm does this.
+- `wasi-logging` prototype feature: an `Append` impl over the
+  `wasi:logging` WIT import (host-provided logging for components).
+  `wasi-observe` proposal (traces/metrics imports) tracked; our
+  Append/Reporter adapter layer makes each a thin feature on arrival.
+  OTLP/HTTP over wasi:http for the OTel reporter: flagged, not built.
 
 **CI matrix addition** (`just check-wasm`): no-default+instant,
 no-default+web (have), PLUS probes: `+serde`, `+backtrace`
