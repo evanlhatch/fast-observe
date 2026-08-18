@@ -505,6 +505,9 @@ fn codegen(
 
                     #(#cfgs)*
                     impl ::core::convert::From<#vname> for ::fast_observe::Fault<#enum_name> {
+                        // track_caller is load-bearing: without it fault
+                        // locations stamp this macro site, not the caller.
+                        #[track_caller]
                         fn from(v: #vname) -> Self {
                             ::fast_observe::Fault::new(#enum_name::#vname(v))
                         }
