@@ -19,10 +19,9 @@ venial = "0.6"
 [dev-dependencies]
 fast-observe = { path = "..", features = ["instant"] }
 trybuild = "1"
-# linkme's distributed_slice expansion references `::linkme` paths, so
-# `error!`-generated registrations need it in scope (same as define_errors!).
-linkme = "0.3"
-
+# NOTE: no linkme here ON PURPOSE — error! registrations route through
+# fast_observe::__private (the #[linkme(crate = ...)] override); consumers
+# need no linkme dep. Do not re-add.
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"

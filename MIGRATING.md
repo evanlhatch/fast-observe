@@ -65,13 +65,13 @@ intentional difference.
 10. **Error registry on wasm.** `linkme` has no linker-section support
     for wasm — on wasm, `error!` emits per-enum `ENTRIES` slices and the
     app registers them once via `fast_observe::register_statics(&[...])`.
-    Consumer crates still need `linkme` in their deps on non-wasm targets:
-    the `distributed_slice` macro's own expansion references `::linkme::`
-    paths even though the attribute resolves through
-    `fast_observe::__private` (linkme-internal limitation). Without
-    registration, `lookup_error` returns `None` on wasm. All other
-    `error!` output (`code()`, `category()`, `Display`, `From`, registry
-    `ENTRY` consts) is unchanged across targets.
+    Consumers need NO `linkme` dependency on any target: registrations use
+    linkme's `#[linkme(crate = ::fast_observe::__private::linkme)]`
+    override so every `::linkme::` path in the expansion resolves through
+    fast-observe's re-export. Without `register_statics`, `lookup_error`
+    returns `None` on wasm. All other `error!` output (`code()`,
+    `category()`, `Display`, `From`, registry `ENTRY` consts) is unchanged
+    across targets.
 11. **Default features**: `fastrace` + `bridge-log` (flatland-observe had
     none). `--no-default-features` gives a minimal build; `bridge-log`
     separately re-exports `logforth::bridge::log` for custom pipelines.

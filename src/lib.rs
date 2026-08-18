@@ -133,6 +133,10 @@ pub mod prelude {
 #[doc(hidden)]
 #[cfg(not(target_family = "wasm"))]
 pub mod __private {
+    // Whole-crate re-export: linkme's macro expansion references
+    // `::linkme::` paths; its `#[linkme(crate = ...)]` override redirects
+    // them here so consumers need NO linkme dependency.
+    pub use linkme;
     pub use linkme::distributed_slice;
 }
 

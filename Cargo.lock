@@ -469,7 +469,6 @@ name = "fast-observe-macros"
 version = "0.1.0"
 dependencies = [
  "fast-observe",
- "linkme",
  "proc-macro2",
  "quote",
  "trybuild",

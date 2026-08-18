@@ -555,6 +555,7 @@ fn codegen(
                     // there (see the platform note on `ERROR_REGISTRY`).
                     #[cfg(not(target_family = "wasm"))]
                     #[::fast_observe::__private::distributed_slice(::fast_observe::ERROR_REGISTRY)]
+                    #[linkme(crate = ::fast_observe::__private::linkme)]
                     static ENTRY_ELEMENT: ::fast_observe::ErrorRegistryEntry = #entry_ref;
                 };
             });
