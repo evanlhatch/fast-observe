@@ -870,7 +870,29 @@ Two fixes to the current usage:
    called once by the app. Explicit, but only on wasm, and the SAME
    doctor/report code runs unchanged above it.
 
-## 11b. wasm audit — design-wide pass (target: wasm32-unknown-unknown)
+## 11b. wasm audit — design-wide pass
+
+**Targets of record (revised): `wasm32-wasip3` (component model) is the
+PRIMARY wasm target — wasi is what we deploy; `wasm32-unknown-unknown`
+(browser) is secondary.** Both are `target_family = "wasm"` so cfgs
+cover both, but the differences matter:
+
+- wasip3: std `Instant` works (WASI monotonic clock) — web-time falls
+  back to std there; stderr/stdout exist (wasi-cli) so logforth's
+  Stdout/Stderr appenders work and the `web` browser-console appender is
+  WRONG there (cfg'd to wasm32-unknown-unknown only... verify: currently
+  `#[cfg(all(feature = "web", target_arch = "wasm32"))]` — needs
+  tightening to exclude wasi); panic=abort typical for components;
+  single-threaded; linkme registry empty → `register_statics`
+  composition is THE registry path on wasip3.
+- unknown-unknown: web-time via performance.now; no std env/fs; `web`
+  feature's console appender; browser-only.
+
+Consumers may use linkme freely if they already have it (flatland does —
+fine), but fast-observe never REQUIRES it: `error!` registrations route
+through `__private` via `#[linkme(crate = ...)]` (shipped).
+
+### Original audit (target: wasm32-unknown-unknown) — still applies, with the wasip3 deltas above
 
 Baseline today: `just check-wasm` builds `--no-default-features
 --features instant|web` with `-Z build-std`; linkme registry empty;

@@ -288,7 +288,10 @@ impl Deployment {
         if traces_on {
             appends.push(Box::new(logforth_append_fastrace::FastraceEvent::default()));
         }
-        #[cfg(all(feature = "web", target_arch = "wasm32"))]
+        // Browser-only (`target_os = "unknown"` — see the `mod web` gate in
+        // profiling.rs): on WASI the appender would call into wasm-bindgen
+        // placeholder imports and panic the guest.
+        #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
         appends.push(Box::new(crate::profiling::web::WebConsoleAppend));
         #[cfg(feature = "file")]
         if file_from_env && let Some(file) = file_appender() {

@@ -60,8 +60,10 @@ bridge-log = ["logforth/bridge-log"]
 bridge-tracing = ["fastrace", "dep:fastrace-tracing"]
 # Re-export fastrace-reqwest (trace context propagation over HTTP).
 http = ["fastrace", "dep:fastrace-reqwest"]
-# Web backend: instant spans + browser-console log appender (wasm32 only;
-# no-op appender on native targets).
+# Web backend: instant spans + browser-console log appender. Browser-only
+# (wasm32-unknown-unknown): on wasm32-wasip3 the console does not exist and
+# the wasm-bindgen/web-sys deps are not even pulled (target-gated below), so
+# the feature degrades to `instant` spans only.
 web = ["instant", "dep:wasm-bindgen", "dep:web-sys"]
 # Mirror error_counts through the `metrics` crate facade.
 metrics-facade = ["dep:metrics"]
@@ -143,7 +145,9 @@ insta = "1"
 # Doctests/tests using define_errors! need linkme in scope (non-wasm).
 linkme = "0.3"
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browser-only: wasm-bindgen placeholder imports panic on WASI targets
+# (proven by wasmtron's observe-spike on wasm32-wasip3).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = { version = "0.2", optional = true }
 web-sys = { version = "0.3", features = ["console"], optional = true }
 

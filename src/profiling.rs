@@ -64,7 +64,11 @@ pub(crate) mod superluminal;
 pub(crate) mod tracing_scope;
 #[cfg(feature = "profile-with-tracy")]
 pub(crate) mod tracy;
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
+// Browser-only: `target_os = "unknown"` excludes wasm32-wasip3 — no
+// browser console exists on WASI, and wasm-bindgen's placeholder imports
+// panic there (proven by wasmtron's observe-spike: WebConsoleAppend →
+// __wbindgen_describe → "function not implemented" → abort).
+#[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
 pub(crate) mod web;
 
 // ── Wrap modules: feature-gated re-exports + ZST stubs ─────────────────────

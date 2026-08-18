@@ -43,6 +43,11 @@ pub use exn::{
 pub use hook::{
     add_capture_hook, add_error_hook, clear_error_hooks, hooks_len, init, set_default_hook_enabled,
 };
+/// Nanoseconds from the target-selected monotonic clock (DESIGN.md §2):
+/// fastant (TSC) native, web-time (→ std on WASI, `performance.now()` in
+/// browsers) on wasm. Needed by wasm consumers, where no other public
+/// API exposes a raw clock read.
+pub use profiling::clock::now_ns;
 #[cfg(feature = "instant")]
 pub use profiling::instant::SpanRecord;
 pub use profiling::{
