@@ -4,6 +4,7 @@
 //! not call `init()`.
 
 use fast_observe::deploy::{DeploymentConfig, InitError, InitGuard, observe};
+use std::assert_matches;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 
@@ -58,7 +59,7 @@ fn panic_hook_chains() {
     let ours = ensure_init();
 
     let result = std::panic::catch_unwind(|| std::panic::panic_any("deliberate test panic"));
-    assert!(result.is_err(), "catch_unwind must observe the panic");
+    assert_matches!(result, Err(_), "catch_unwind must observe the panic");
 
     // Ordering across the two tests in this binary is nondeterministic:
     // if init_twice_second_errors won the OnceLock, ITS init (also
@@ -177,5 +178,5 @@ fn config_roundtrip_json() {
 
     // `deny_unknown_fields` rejects a bogus key.
     let bogus: Result<DeploymentConfig, _> = serde_json::from_str(r#"{"levl": "info"}"#);
-    assert!(bogus.is_err(), "unknown field `levl` must be rejected");
+    assert_matches!(bogus, Err(_), "unknown field `levl` must be rejected");
 }

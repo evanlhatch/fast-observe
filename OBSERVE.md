@@ -3,9 +3,8 @@
 Read this before writing or debugging code in a repo that uses `fast-observe`.
 It is short on purpose: the surface is five verbs.
 
-Status markers: **[live]** = in `src/` today. **[landing]** = designed
-(DESIGN.md/SURFACE.md) but not yet in the tree — do not write code
-against it.
+Status marker: **[live]** = in `src/` today. Everything in this guide is
+live unless a cargo feature flag is named next to it.
 
 ## Why
 
@@ -23,15 +22,16 @@ almost nothing.
 
 ```rust
 use fast_observe::prelude::*;   // [live] one import: Fault/Frame/Result/ResultExt/
-                                // OptionExt, bail!/ensure!/scope!/finish_frame!/error!/
-                                // define_errors!, instrument/all_functions/skip, init/observe,
-                                // doctor/lookup_error/error_registry/error_counts,
-                                // render_report/report_display, add_error_hook/
-                                // add_capture_hook, config/Backends, Category/Policy/
-                                // Attachment/Placement/Coded. NOT in it: profiling!/
-                                // func_path! (the `profiling` name would collide with the
-                                // profiling module), root_span!/in_observed_span,
-                                // render_report_json, Deployment/InitGuard/InitError —
+                                // OptionExt, bail!/ensure!/scope!/finish_frame!/error!,
+                                // instrument/all_functions/skip, instrument_async, main,
+                                // init/observe, doctor/lookup_error/error_registry/
+                                // error_counts, render_report/report_display,
+                                // add_error_hook/add_capture_hook, config/Backends,
+                                // Category/Policy/Attachment/Placement/Coded.
+                                // NOT in it: profiling!/func_path! (the `profiling`
+                                // name would collide with the profiling module),
+                                // root_span!/in_observed_span, render_report_json,
+                                // Deployment/InitGuard/InitError, HookId —
                                 // import those from their modules.
 
 log::info!(user_id = 42; "connected");   // [live] POINTS: plain log macros. No
@@ -53,16 +53,16 @@ with `#[skip]` opt-outs — all [live], from `fast_observe_macros`,
 re-exported at the crate root and in the prelude, expanding to
 `::fast_observe` paths) to instrument without writing `scope!` by hand.
 Defining typed errors with codes: the thiserror-style `error!` proc macro
-is [live] and the primary path; `define_errors!` stays supported through
-0.x as the deprecated alias.
+is [live] and the only path.
 
 That's it. If you know `log` and `anyhow`, you already know the verbs.
 
 ## Setup (binaries)
 
 ```rust
-fn main() -> fast_observe::Result<()> {   // Result works like anyhow's
-    fast_observe::init();                 // [live] logs + traces with defaults
+#[fast_observe::main]                   // [live] Err → full report to stderr +
+fn main() -> fast_observe::Result<()> {   // category's sysexits code (or write
+    fast_observe::init();                 // `fn main() -> fast_observe::Fault` directly)
     // ...
 }
 ```
@@ -71,8 +71,10 @@ Configurable path [live]: `let _guard = fast_observe::observe().level(..).
 file_from_env(true).init()?;` — the `Deployment` builder returns an
 `InitGuard` whose drop flushes fastrace, and double-init is an
 `Err(InitError)` instead of silently ignored. Two more builder defaults
-[live]: `panic_hook(true)` logs panics as structured error events (target
-`fast_observe.panic`), then chains the previously installed hook — never
+[live]: `panic_hook(true)` routes panics through the SAME error pipeline —
+each panic becomes a `Fault` (category Fatal, real panic location attached,
+backtrace when enabled), so panics are counted, hooked, and rendered exactly
+like returned errors — then chains the previously installed hook, never
 stomped; `flush_on_exit(true)` (feature `flush-on-exit`, native only)
 flushes fastrace on atexit/SIGTERM/SIGHUP.
 
@@ -118,32 +120,43 @@ fn load(id: u64) -> fast_observe::Result<Entity, EngineError> {
     // `#[from]` gives From<io::Error> for the enum but NOT for Fault<Enum>
     // (orphan rule) — write `err.map_err(EngineError::from)?`.
     // .wrap_msg("loading entity") for the anyhow-style message form [live];
-    // .context(...) aliases are [landing] (SURFACE.md §6a)
+    // .context(msg)/.with_context(|| ..) convert to Fault<BoxError> [live].
     Ok(e)
 }
 ```
 
-The macro_rules `define_errors!` covers the same surface in compact form
-— [live], supported through 0.x, but deprecated: new code uses `error!`.
-
 The report renderer is [live]: `render_report(&fault) -> String`,
 `report_display(&fault)` (streaming `Display`, no report-string
 allocation), `render_report_json(&fault)` (feature `serde`, versioned
-`"schema": 1`). Codes/categories are read through `Error::provide` with a
+`"schema": 2`). Codes/categories are read through `Error::provide` with a
 registry fallback, so `error!` types report fully. One fact per line,
-deterministic, no colors, no timestamps:
+deterministic, no colors, no timestamps; every interpolated value is
+newline-escaped, so data can never forge a report line. The first line
+marks the format (`report: fast-observe/1`); cause lines carry the frame's
+type (when not erased) + location, and the edge kind distinguishes
+`cause` (source chain) / `original` (wrapped) / `attempt` (retry) /
+`failure` (batch):
 
 ```
-error: [E001] entity not found: 17
+report: fast-observe/1
+error: [E001] [my_crate::repo::NotFound] entity not found: 17
 category: Content (policy: fix the input; retrying unchanged input will fail)
 location: src/repo.rs:42:10
 scope: request → load_entity (elapsed 3ms)
 attachment: attempt=3
-cause 0: [E001] entity not found: 17
+cause 0: [E001] [my_crate::repo::NotFound] entity not found: 17, at src/repo.rs:42:10
+cause 1: No such file or directory (os error 2), at src/repo.rs:42:10
 trace_id: 4f3c9a2b…          # same id on every log line and span
+fingerprint: 9f86d081        # stable per failure site — dedupe across runs
 advice: check the entity table
-action: fix the input; retrying unchanged input will fail; see `doctor E001`
+action: fix the input; retrying unchanged input will fail
+hint: run `doctor E001`
 ```
+
+Volatile process state (occurrence count of this error type, thread name,
+uptime) rides as structured kv fields on the hook's log event — the report
+body stays a pure function of the fault. `OBSERVE_REPORT_SOURCE=1` adds a
+`source:` line with the code at the root location.
 
 What feeds it [all live]: every `Fault` captures the caller location, the
 fastrace `trace_id` (and emits an `error` span event, so the failure lands
@@ -179,10 +192,13 @@ polls next. Cross-await spans [live, feature `fastrace`]: bind
 `fast_observe::root_span!("request")` once per task (continue an incoming
 trace with `root_span!("request", ctx)`), wrap futures with
 `.in_observed_span("load")` (`profiling::async_::ObservedFutureExt`) — the
-span enters on every poll and follows the task across threads. W3C
-`traceparent` helpers (`extract_traceparent`/`inject_traceparent`) live in
-`profiling::async_` too; `fastrace::trace(enter_on_poll = true)` via the
-fastrace dep also works.
+span enters on every poll and follows the task across threads. The attribute
+form is `#[fast_observe::instrument_async]` [live, feature `fastrace`] — an
+async fn so marked gets a fastrace span entered on each poll, no direct
+fastrace dependency needed. W3C trace-context helpers
+(`extract_traceparent`/`inject_traceparent`, and the full
+`extract_headers`/`inject_headers` incl. tracestate) live in
+`profiling::async_` too.
 
 Benchmarks [live, feature `bench` — implies `instant`]:
 `fast_observe::bench` re-exports divan (write `#[divan::bench(crate =

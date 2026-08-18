@@ -55,7 +55,7 @@ pub fn on_enable() {
 }
 
 /// Guard — the `ProfilerScope` ends on drop (when `scope` is `Some`).
-#[allow(dead_code, reason = "field held only for its Drop side effect")]
+#[expect(dead_code, reason = "field held only for its Drop side effect")]
 pub struct PuffinGuard {
     scope: Option<puffin::ProfilerScope>,
 }

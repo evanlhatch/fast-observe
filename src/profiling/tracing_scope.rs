@@ -12,9 +12,10 @@ use tracing::span::EnteredSpan;
 /// Enter a tracing span; the runtime name is the `name` field.
 #[must_use]
 pub fn enter(name: &'static str, tag: Option<&'static str>) -> TracingGuard {
-    let span = match tag {
-        Some(t) => tracing::info_span!("observe.scope", name, tag = t),
-        None => tracing::info_span!("observe.scope", name),
+    let span = if let Some(t) = tag {
+        tracing::info_span!("observe.scope", name, tag = t)
+    } else {
+        tracing::info_span!("observe.scope", name)
     };
     TracingGuard(Some(span.entered()))
 }
@@ -26,5 +27,5 @@ pub const fn dummy() -> TracingGuard {
 }
 
 /// Guard — the entered span exits on drop (when the inner span is `Some`).
-#[allow(dead_code, reason = "field held only for its Drop side effect")]
+#[expect(dead_code, reason = "field held only for its Drop side effect")]
 pub struct TracingGuard(Option<EnteredSpan>);

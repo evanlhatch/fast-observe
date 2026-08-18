@@ -87,8 +87,21 @@
 
   enterShell = ''
     export CARGO_BUILD_JOBS=$(($(nproc) - 1))
-    mkdir -p "${config.env.DEVENV_STATE}/coverage/profiles"
     mkdir -p "${config.env.DEVENV_STATE}/bolero-corpus"
+
+    # ── Disk autoprune: bound build bloat, keep fresh caches for speed ──
+    # cargo never prunes old build-script OUT_DIRs or incremental state;
+    # sweep the stale (>5d) ones on every shell entry. Whole target dirs
+    # idle >30d get removed entirely. Fresh caches survive → dev loop fast.
+    if [ -d target ]; then
+      find target/debug/incremental target/debug/build -mindepth 1 -maxdepth 1 -type d -mtime +5 -exec rm -rf {} + 2>/dev/null || true
+    fi
+    find . -maxdepth 4 \( -name .git -o -name .jj -o -name .devenv -o -name node_modules \) -prune -o \
+         -type d -name target -mtime +30 -prune -exec rm -rf {} + 2>/dev/null || true
+
+    # incremental compiles off by default (bloat guard). Override per-session
+    # with `CARGO_INCREMENTAL=1` for a hot edit loop; autoprune bounds it.
+    export CARGO_INCREMENTAL=0
 
     echo "🦀 fast-observe Rust dev environment ready"
   '';

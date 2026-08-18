@@ -1,0 +1,5 @@
+error: error code must match `PREFIX+digits` (e.g. "E100") — got "nope"
+  --> tests/ui/invalid_code_format.rs:12:18
+   |
+12 |         #[code = "nope", category = Content]
+   |                  ^^^^^^

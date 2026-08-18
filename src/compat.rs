@@ -3,128 +3,154 @@
 //! `map_err` point at the crate boundary; the causal tree is preserved in
 //! both directions.
 
-/// anyhow ↔ `Fault` boundary (feature `anyhow-boundary`).
+/// Generates one explicit `Fault` ↔ foreign-error boundary module
+/// (DESIGN.md §5.9: explicit `map_err` points, never implicit `From`).
 ///
-/// Note: `Fault<BoxError>` (`BoxError` = `Box<dyn Error + Send +
-/// Sync>`) cannot go through [`into_anyhow`]: std's `impl<E: Error> Error
-/// for Box<E>` requires `E: Sized`, so boxed errors are not `Error` and
-/// `Fault<BoxError>` has no `Error` impl. Convert typed faults only.
+/// anyhow and eyre each erase their sources into their own representation
+/// and expose no `&dyn Error` with `Send + Sync`, so their boundaries are
+/// structurally identical: a `Debug`-deriving newtype wrapping the foreign
+/// error, a delegating `Display`, an `Error` impl with `source()`
+/// intentionally absent (the chain survives through formatting only), an
+/// `inner()` accessor, a `#[track_caller]` `from_*` `map_err` point, and an
+/// outbound `into_*` conversion.
 ///
-/// [`into_anyhow`]: anyhow_boundary::into_anyhow
-#[cfg(feature = "anyhow-boundary")]
-pub mod anyhow_boundary {
-    use std::fmt;
+/// Parameters (one boundary per instantiation):
+/// - `$(#[$mod_attr])*` — attributes for the generated module (the
+///   `#[cfg(feature = ...)]` gate plus the module doc comment).
+/// - `module:` — the generated module name (e.g. `anyhow_boundary`).
+/// - `newtype:` — the wrapper struct name (e.g. `AnyhowError`).
+/// - `wrapped:` — the foreign error type being wrapped (`anyhow::Error`,
+///   `eyre::Report`).
+/// - `from:` — the inbound `map_err` fn name (`from_anyhow`).
+/// - `into:` — the outbound conversion fn name (`into_anyhow`).
+/// - `$(#[$into_attr])*` — attributes for the `into_*` fn (`#[must_use]`,
+///   or none when the outbound type is already `#[must_use]`).
+/// - `outbound:` — the `into_*` return type (`anyhow::Error`,
+///   `eyre::Report`).
+/// - `struct_doc:` — the newtype's doc comment (must document the wrapped
+///   type and why `source()` is absent).
+#[allow(
+    unused_macros,
+    reason = "every instantiation is feature-gated (anyhow-boundary, compat-eyre); the macro is unused when both are off"
+)]
+macro_rules! compat_wrapper {
+    (
+        $(#[$mod_attr:meta])*
+        module: $module:ident,
+        newtype: $newtype:ident,
+        wrapped: $wrapped:path,
+        from: $from:ident,
+        into: $into:ident,
+        $(#[$into_attr:meta])*
+        outbound: $outbound:path,
+        struct_doc: $struct_doc:literal,
+    ) => {
+        $(#[$mod_attr])*
+        pub mod $module {
+            use std::fmt;
 
-    /// Wraps [`anyhow::Error`], preserving its message chain.
-    ///
-    /// anyhow erases its sources into its own representation, so the
-    /// wrapped error exposes NO `Error::source()` — the chain survives
-    /// through formatting only: `Display` prints the top message,
-    /// alternate `Display` (`{:#}`) prints the cause chain, and `Debug`
-    /// (`{:?}`) prints the chain plus backtrace when captured.
-    #[derive(Debug)]
-    pub struct AnyhowError(anyhow::Error);
+            #[doc = $struct_doc]
+            #[derive(Debug)]
+            pub struct $newtype($wrapped);
 
-    impl fmt::Display for AnyhowError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            fmt::Display::fmt(&self.0, f)
+            impl fmt::Display for $newtype {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    fmt::Display::fmt(&self.0, f)
+                }
+            }
+
+            impl std::error::Error for $newtype {
+                // source() intentionally absent: the wrapped error type
+                // does not expose its inner error as a `&dyn Error` with
+                // `Send + Sync`, so the chain cannot be lifted into
+                // `Error::source()`. It survives through formatting only —
+                // `Display` prints the top message, alternate `Display`
+                // (`{:#}`) prints the cause chain, and `Debug` (`{:?}`)
+                // prints the chain plus backtrace when captured. See the
+                // struct docs for the per-crate specifics.
+            }
+
+            impl $newtype {
+                /// Access the wrapped error type (e.g. for downcasting).
+                #[must_use]
+                pub fn inner(&self) -> &$wrapped {
+                    &self.0
+                }
+            }
+
+            /// The explicit `map_err` point (DESIGN.md §5.9). Wraps the
+            /// error, preserving its message chain in the frame; the
+            /// `Fault` hooks fire as for any other error construction.
+            #[track_caller]
+            pub fn $from(e: $wrapped) -> crate::Fault<$newtype> {
+                crate::Fault::new($newtype(e))
+            }
+
+            /// The explicit outbound boundary. The causal tree survives:
+            /// `Fault`'s `Error::source()` chains into the tree's
+            /// first-branch frames, and its `Debug` renders the full tree.
+            $(#[$into_attr])*
+            pub fn $into<E: std::error::Error + Send + Sync + 'static>(
+                f: crate::Fault<E>,
+            ) -> $outbound {
+                <$outbound>::new(f)
+            }
         }
-    }
-
-    impl std::error::Error for AnyhowError {
-        // source() intentionally absent: anyhow::Error does not expose its
-        // inner error as &dyn Error. The chain is readable via {:#} / {:?}.
-    }
-
-    impl AnyhowError {
-        /// Access the wrapped `anyhow::Error` (e.g. for downcasting).
-        #[must_use]
-        pub fn inner(&self) -> &anyhow::Error {
-            &self.0
-        }
-    }
-
-    /// `anyhow::Error` → `Fault<AnyhowError>` — the explicit `map_err`
-    /// point. Wraps the error, preserving its message chain in the frame;
-    /// the `Fault` hooks fire as for any other error construction.
-    #[track_caller]
-    pub fn from_anyhow(e: anyhow::Error) -> crate::Fault<AnyhowError> {
-        crate::Fault::new(AnyhowError(e))
-    }
-
-    /// `Fault<E>` → `anyhow::Error`. The causal tree survives: `Fault`'s
-    /// `Error::source()` chains into the tree's first-branch frames, and
-    /// its `Debug` renders the full tree.
-    #[must_use]
-    pub fn into_anyhow<E: std::error::Error + Send + Sync + 'static>(
-        f: crate::Fault<E>,
-    ) -> anyhow::Error {
-        anyhow::Error::new(f)
-    }
+    };
 }
 
-/// eyre ↔ `Fault` boundary (feature `compat-eyre`).
-///
-/// Mirrors [`anyhow_boundary`]: eyre erases its sources into its own
-/// representation exactly like anyhow, so the same erased-chain caveat
-/// applies — and the same `Fault<BoxError>` restriction on
-/// [`into_eyre`] (typed faults only).
-///
-/// [`into_eyre`]: eyre_boundary::into_eyre
-#[cfg(feature = "compat-eyre")]
-pub mod eyre_boundary {
-    use std::fmt;
-
-    /// Wraps [`eyre::Report`], preserving its message chain.
+#[cfg(feature = "anyhow-boundary")]
+compat_wrapper! {
+    /// anyhow ↔ `Fault` boundary (feature `anyhow-boundary`).
     ///
-    /// eyre erases its sources into its own representation, so the wrapped
-    /// error exposes NO `Error::source()` — the chain survives through
-    /// formatting only: `Display` prints the top message, alternate
-    /// `Display` (`{:#}`) prints the cause chain one per line, and `Debug`
-    /// (`{:?}`) prints the chain plus backtrace when captured.
-    /// [`eyre::Report::chain`] exists but yields `&dyn Error` WITHOUT
-    /// `Send + Sync`, so it cannot be lifted into `Error::source()` —
-    /// identical to the anyhow boundary.
-    #[derive(Debug)]
-    pub struct EyreError(eyre::Report);
+    /// Note: `Fault<BoxError>` (`BoxError` = `Box<dyn Error + Send +
+    /// Sync>`) cannot go through [`into_anyhow`]: std's `impl<E: Error> Error
+    /// for Box<E>` requires `E: Sized`, so boxed errors are not `Error` and
+    /// `Fault<BoxError>` has no `Error` impl. Convert typed faults only.
+    ///
+    /// [`into_anyhow`]: anyhow_boundary::into_anyhow
+    module: anyhow_boundary,
+    newtype: AnyhowError,
+    wrapped: anyhow::Error,
+    from: from_anyhow,
+    into: into_anyhow,
+    #[must_use]
+    outbound: anyhow::Error,
+    struct_doc:
+        "Wraps [`anyhow::Error`], preserving its message chain.\n\n\
+         anyhow erases its sources into its own representation, so the \
+         wrapped error exposes NO `Error::source()` — the chain survives \
+         through formatting only: `Display` prints the top message, \
+         alternate `Display` (`{:#}`) prints the cause chain, and `Debug` \
+         (`{:?}`) prints the chain plus backtrace when captured.",
+}
 
-    impl fmt::Display for EyreError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            fmt::Display::fmt(&self.0, f)
-        }
-    }
-
-    impl std::error::Error for EyreError {
-        // source() intentionally absent: eyre::Report does not expose its
-        // inner error as &dyn Error + Send + Sync. The chain is readable
-        // via {:#} / {:?}.
-    }
-
-    impl EyreError {
-        /// Access the wrapped `eyre::Report` (e.g. for downcasting).
-        #[must_use]
-        pub fn inner(&self) -> &eyre::Report {
-            &self.0
-        }
-    }
-
-    /// `eyre::Report` → `Fault<EyreError>` — the explicit `map_err`
-    /// point. Wraps the report, preserving its message chain in the frame;
-    /// the `Fault` hooks fire as for any other error construction.
-    #[track_caller]
-    pub fn from_eyre(e: eyre::Report) -> crate::Fault<EyreError> {
-        crate::Fault::new(EyreError(e))
-    }
-
-    /// `Fault<E>` → `eyre::Report`. The causal tree survives: `Fault`'s
-    /// `Error::source()` chains into the tree's first-branch frames, and
-    /// its `Debug` renders the full tree.
-    // No #[must_use]: `eyre::Report` is already #[must_use].
-    pub fn into_eyre<E: std::error::Error + Send + Sync + 'static>(
-        f: crate::Fault<E>,
-    ) -> eyre::Report {
-        eyre::Report::new(f)
-    }
+#[cfg(feature = "compat-eyre")]
+compat_wrapper! {
+    /// eyre ↔ `Fault` boundary (feature `compat-eyre`).
+    ///
+    /// Mirrors [`anyhow_boundary`]: eyre erases its sources into its own
+    /// representation exactly like anyhow, so the same erased-chain caveat
+    /// applies — and the same `Fault<BoxError>` restriction on
+    /// [`into_eyre`] (typed faults only).
+    ///
+    /// [`into_eyre`]: eyre_boundary::into_eyre
+    module: eyre_boundary,
+    newtype: EyreError,
+    wrapped: eyre::Report,
+    from: from_eyre,
+    into: into_eyre,
+    outbound: eyre::Report,
+    struct_doc:
+        "Wraps [`eyre::Report`], preserving its message chain.\n\n\
+         eyre erases its sources into its own representation, so the wrapped \
+         error exposes NO `Error::source()` — the chain survives through \
+         formatting only: `Display` prints the top message, alternate \
+         `Display` (`{:#}`) prints the cause chain one per line, and `Debug` \
+         (`{:?}`) prints the chain plus backtrace when captured. \
+         [`eyre::Report::chain`] exists but yields `&dyn Error` WITHOUT \
+         `Send + Sync`, so it cannot be lifted into `Error::source()` — \
+         identical to the anyhow boundary.",
 }
 
 /// error-stack ↔ `Fault` boundary (feature `compat-error-stack`).

@@ -8,8 +8,7 @@ edition = "2024"
 authors = ["evan"]
 license = "MIT OR Apache-2.0"
 description = "Error faults with causal trees + fastrace-first profiling/log orchestration"
-# TODO: set before publishing
-# repository = "https://github.com/<org>/fast-observe"
+repository = "https://github.com/evanlhatch/fast-observe"
 keywords = ["error-handling", "profiling", "logging", "tracing", "observability"]
 categories = ["development-tools::debugging", "rust-patterns"]
 
@@ -79,6 +78,21 @@ profile-with-superluminal = ["dep:superluminal-perf"]
 serde = ["dep:serde", "camino/serde1"]
 # fastrace-futures re-export (Stream tracing; FutureExt is in fastrace core).
 int-futures = ["fastrace", "dep:fastrace-futures"]
+# Re-export fastrace-axum (axum middleware span layer).
+int-axum = ["fastrace", "dep:fastrace-axum"]
+# Re-export fastrace-poem (poem middleware).
+int-poem = ["fastrace", "dep:fastrace-poem"]
+# Re-export fastrace-tonic (gRPC client/server span layers).
+int-tonic = ["fastrace", "dep:fastrace-tonic"]
+# Re-export fastrace-tower (generic tower Service/Layer).
+int-tower = ["fastrace", "dep:fastrace-tower"]
+# Re-export fastrace-datadog reporter (Datadog agent exporter). Its reqwest
+# dep is native-tls-only (no rustls flag upstream), so unify openssl onto the
+# vendored build: the devenv exposes no system openssl.pc.
+reporter-datadog = ["fastrace", "dep:fastrace-datadog", "dep:openssl"]
+# Re-export fastrace-jaeger reporter (legacy Jaeger Thrift exporter; prefer
+# `otel` — Jaeger natively accepts OTLP since 1.35).
+reporter-jaeger = ["fastrace", "dep:fastrace-jaeger"]
 # Backtrace capture hook (std::backtrace; honors RUST_BACKTRACE).
 backtrace = []
 # best-effort fastrace flush on process exit (atexit/SIGTERM).
@@ -98,14 +112,13 @@ anyhow-boundary = ["dep:anyhow"]
 parking_lot = "0.12"
 log = { version = "0.4", features = ["kv"] }
 logforth = { version = "0.30", features = ["starter-log"] }
-documented = "0.10"
 strum = { version = "0.26", features = ["derive"] }
 derive_more = { version = "1.0", features = ["display"] }
 sealed = "0.6"
 camino = "1.2"
 fs-err = "3.3"
 bon = "3"
-fast-observe-macros = { path = "fast-observe-macros" }
+fast-observe-macros = { version = "0.1.0", path = "fast-observe-macros" }
 ariadne = "0.6"
 anyhow = { version = "1", optional = true, default-features = false }
 humantime = { version = "2.2", optional = true }
@@ -133,6 +146,14 @@ tracy-client = { version = "0.18", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 fastrace-futures = { version = "0.7", optional = true }
+fastrace-axum = { version = "0.2", optional = true }
+fastrace-poem = { version = "0.2", optional = true }
+fastrace-tonic = { version = "0.2", optional = true }
+fastrace-tower = { version = "0.2", optional = true }
+fastrace-datadog = { version = "0.7", optional = true }
+fastrace-jaeger = { version = "0.7", optional = true }
+# Feature-unification only (vendored TLS for reporter-datadog); not re-exported.
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 divan = { version = "0.1", optional = true }
 libc = { version = "0.2", optional = true }
 eyre = { version = "0.6", optional = true }
@@ -142,14 +163,27 @@ tokio = { version = "1", optional = true, default-features = false }
 [dev-dependencies]
 serde_json = "1"
 insta = "1"
+bolero = "0.13"
 # Doctests/tests using define_errors! need linkme in scope (non-wasm).
 linkme = "0.3"
+# Compile-time auto-trait contracts (tests/auto_traits.rs). NOTE: this is
+# `static_assertions` (underscore) — the `staticassertions` crate is not
+# served by this environment's registry mirror; same author, same macro API.
+static_assertions = "1"
 
 # Browser-only: wasm-bindgen placeholder imports panic on WASI targets
 # (proven by wasmtron's observe-spike on wasm32-wasip3).
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = { version = "0.2", optional = true }
-web-sys = { version = "0.3", features = ["console"], optional = true }
+web-sys = { version = "0.3", features = [
+    "console",
+    # Timeline marks: performance.mark/measure + window.performance.
+    "Performance",
+    "Window",
+    # pagehide unload flush listener (install_unload_flush).
+    "EventTarget",
+    "AddEventListenerOptions",
+], optional = true }
 
 # Clock split (DESIGN.md §2): web-time on wasm, fastant (TSC) on native.
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -201,6 +235,11 @@ manual_flatten = "warn"
 # let x = expr; x → expr.
 let_and_return = "warn"
 redundant_pub_crate = "warn"
+
+[[bench]]
+name = "scope_overhead"
+harness = false
+required-features = ["bench"]
 
 [package.metadata.docs.rs]
 all-features = true

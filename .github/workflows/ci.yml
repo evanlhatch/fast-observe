@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo test
+      - run: cargo test --all-features
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: false
+      # Mirrors `just check-wasip3` / `just check-wasm`.
+      - run: cargo check --target wasm32-wasip3 -Z build-std=std,panic_abort --no-default-features --features instant
+      - run: cargo check --target wasm32-wasip3 -Z build-std=std,panic_abort --no-default-features --features backtrace
+      - run: cargo check --target wasm32-wasip3 -Z build-std=std,panic_abort --no-default-features --features fastrace
+      - run: cargo check --target wasm32-wasip3 -Z build-std=std,panic_abort --no-default-features --features web
+      - run: cargo check --target wasm32-unknown-unknown -Z build-std=std,panic_abort --no-default-features --features instant
+      - run: cargo check --target wasm32-unknown-unknown -Z build-std=std,panic_abort --no-default-features --features web

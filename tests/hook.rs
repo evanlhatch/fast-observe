@@ -290,6 +290,119 @@ fn capture_hook_panic_is_contained() {
 
 unique_error!(ScopedCaptureError, "scoped capture");
 
+// ── Span-trail breadcrumbs (feature `instant`) ────────────────────────────
+
+#[cfg(feature = "instant")]
+unique_error!(BreadcrumbError, "breadcrumb trail");
+
+#[cfg(feature = "instant")]
+#[test]
+#[allow(
+    clippy::items_after_statements,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test"
+)]
+fn breadcrumb_trail_attached_on_fault_with_instant_backend() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let cfg = config::config();
+    let original = cfg.backends();
+    cfg.set_backends(config::Backends::INSTANT);
+    fast_observe::profiling::instant::clear();
+    // The default hook wraps its log in `scope!("error")`, which would record
+    // into FINISHED and skew the post-fault drain count — disable it for the
+    // duration of this test (restored below).
+    set_default_hook_enabled(false);
+
+    {
+        let _outer = fast_observe::scope!("crumb_outer");
+        let _inner = fast_observe::scope!("crumb_inner");
+    }
+    let f = Fault::new(BreadcrumbError);
+
+    set_default_hook_enabled(true);
+    cfg.set_backends(original);
+
+    let trail = f
+        .frame()
+        .attachments()
+        .iter()
+        .find(|a| a.key() == Some("span_trail"))
+        .expect("built-in breadcrumb hook must attach span_trail");
+    assert_eq!(
+        trail.placement(),
+        fast_observe::Placement::Appendix,
+        "span_trail must be Appendix (counted, not inlined)"
+    );
+    let rendered = trail.display();
+    assert!(
+        rendered.contains("crumb_outer"),
+        "trail must name the outer scope: {rendered}"
+    );
+    assert!(
+        rendered.contains("crumb_inner"),
+        "trail must name the inner scope: {rendered}"
+    );
+    // Non-destructive: the breadcrumb peek must not have drained FINISHED.
+    assert_eq!(
+        fast_observe::profiling::instant::drain().len(),
+        2,
+        "span_trail capture must leave the accumulator undisturbed"
+    );
+}
+
+#[cfg(feature = "instant")]
+unique_error!(NoBreadcrumbError, "no breadcrumb");
+
+#[cfg(feature = "instant")]
+#[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
+fn no_breadcrumbs_when_backend_off() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let cfg = config::config();
+    let original = cfg.backends();
+    cfg.set_backends(config::Backends::OFF);
+    fast_observe::profiling::instant::clear();
+
+    let f = Fault::new(NoBreadcrumbError);
+    cfg.set_backends(original);
+
+    assert!(
+        f.frame()
+            .attachments()
+            .iter()
+            .all(|a| a.key() != Some("span_trail")),
+        "no span_trail attachment when the instant backend is off"
+    );
+}
+
+#[cfg(feature = "instant")]
+#[test]
+#[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
+fn peek_recent_is_non_destructive_and_bounded() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    use fast_observe::profiling::instant::{clear, drain, enter, peek_recent};
+    clear();
+    // Static names — `enter` needs &'static str.
+    const NAMES: [&str; 10] = ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"];
+    for name in NAMES {
+        drop(enter(name, None));
+    }
+
+    let peeked = peek_recent(3);
+    let names: Vec<_> = peeked.iter().map(|s| s.name).collect();
+    assert_eq!(
+        names,
+        vec!["p7", "p8", "p9"],
+        "peek_recent(3) must return the 3 newest spans, oldest→newest"
+    );
+    assert_eq!(
+        drain().len(),
+        10,
+        "peek must be non-destructive — drain still yields all 10 spans"
+    );
+}
+
 #[test]
 #[allow(clippy::items_after_statements, clippy::unwrap_used, reason = "test")]
 fn scope_path_attached_when_scoped() {

@@ -1,15 +1,18 @@
 # fast-observe — user surface design
 
+> The user-surface contract this crate was built to. The live reference is rustdoc + OBSERVE.md; where this doc and the code disagree, the code wins.
+
 Internals are in DESIGN.md. This doc is the contract with the user. Grounded
-in observed usage in ~/flatland (the only real consumer):
+in observed usage in downstream consumers:
 
 - Verbs actually used: `bail!` ×57, `.report()` ×32, `scope!` ×15.
   `change_context`/`wrap_msg`/`observed` ≈ 0. Constructor + swallow are the
   vocabulary; design for that.
 - Every crate hand-writes 4 things around `define_errors!`: the enum, the
   `impl Error`, a constructor helper (`compile_err!`), a size assertion.
-- flatland-renderer has 5 variants with `source: Box<RenderError>` fields
-  and an `impl Error` with **no `source()`** — causal chain silently broken.
+- One consumer crate's renderer error type has 5 variants with
+  `source: Box<RenderError>` fields and an `impl Error` with **no
+  `source()`** — causal chain silently broken.
 - `fast_observe::init()` is the only setup call. Doctor CLI hand-rolled.
 
 ---
@@ -103,8 +106,7 @@ builder makes that unrepresentable instead of surprising.
 
 `OBSERVE_LOG` (→ RUST_LOG fallback, needs `filter-rustlog`), `OBSERVE_PROFILE`,
 `OBSERVE_LOG_DIR`, `OBSERVE_ERROR_THROTTLE`, `OBSERVE_BACKTRACE`,
-`OBSERVE_COLOR`, `OTEL_EXPORTER_OTLP_ENDPOINT` (prod preset auto-wires otel
-when set). `Deployment::from_env()` = zero-code deployment.
+`OBSERVE_COLOR`. `Deployment::from_env()` = zero-code deployment.
 
 ### Config files — figment-compatible, NOT figment-dependent
 
@@ -234,16 +236,16 @@ dependencies — the standard pattern, documented in README.
 ## 5. Tier C: `error!` — declarative errors, thiserror-grade
 
 Replaces `define_errors!` + the 4 hand-written artifacts around it. Real
-before/after from flatlandc (58 lines → ~12):
+before/after (58 lines → ~12):
 
 ```rust
-// BEFORE (crates/flatlandc/src/errors.rs): hand enum + macro block +
-// impl Error + compile_err! helper macro + CompileResult alias.
+// BEFORE: hand enum + macro block + impl Error + compile_err! helper
+// macro + CompileResult alias.
 
 // AFTER:
 fast_observe::error! {
-    /// flatlandc's error type.
-    pub enum FlatlandcError {
+    /// The app's error type.
+    pub enum AppError {
         /// Build-time compiler error — designer bug, not engine fault.
         #[code = "E100", category = Content]
         CompileError { detail: String }
@@ -281,12 +283,12 @@ Generated per invocation (nothing hand-written remains):
 
 1. the enum (doc comments pass through) + variant structs
 2. `impl Error` — **`source()` auto-wired from any `#[source]`/named-`source`
-   field** (kills flatland-renderer's silently-broken chain class)
+   field** (kills the silently-broken-source-chain class)
 3. `Display` per variant + enum, from the `=> "…"` template (`{field}` and
    `{field:?}` interpolation, same as today)
 4. `From<Variant> for Enum` **and `From<Variant> for Fault<Enum>`** —
    the second one is what kills `compile_err!`: `bail!(CompileError {
-   detail })` now works in any fn returning `Result<T, FlatlandcError>`,
+   detail })` now works in any fn returning `Result<T, AppError>`,
    and `Err(CompileError{..})?` propagates. (Orphan-legal: both types
    concrete, variant type local.)
 5. `code()` / `category()` / `advice()` + `Coded` trait impl — attribute
@@ -295,27 +297,27 @@ Generated per invocation (nothing hand-written remains):
 6. registry entry incl. advice (doctor gets prescriptive text, not just a
    display string)
 7. `const _` size assertion (default ≤ 64, overridable
-   `#[max_size = 128]` on the enum) — flatland hand-writes this today
+   `#[max_size = 128]` on the enum) — consumers hand-write this today
 8. per-variant constructors `Enum::compile_error(detail)` → `Fault<Enum>`
    — one call from value to wired fault
 
-`define_errors!` stays one release as a deprecated alias (positional form
-maps onto the attribute form mechanically).
+`define_errors!` was the predecessor macro; its positional form maps onto
+the attribute form mechanically.
 
 ### bail!/ensure! upgrade (the ×57 verb)
 
 ```rust
 bail!(CompileError { detail: format!("bad plan: {p}") });   // From<Variant> for Fault<Enum>
 bail!(CompileError, "bad plan: {p}");                        // detail-field shorthand (today's form)
-bail!(FlatlandcError::CompileError, "bad plan: {p}");        // enum-qualified shorthand
+bail!(AppError::CompileError, "bad plan: {p}");               // enum-qualified shorthand
 ensure!(tick < MAX, JournalError::OutOfRange, "past last tick {last}");
 ```
 
 ### Doctor, provided
 
 `fast_observe::doctor(code) -> Option<String>` renders code, name,
-category, policy, canonical display, advice, defining crate. flatlandc's
-hand-rolled 35-line subcommand becomes `print!("{}", doctor(&code)?)`.
+category, policy, canonical display, advice, defining crate. A hand-rolled
+doctor CLI subcommand becomes `print!("{}", doctor(&code)?)`.
 
 ---
 
@@ -337,7 +339,7 @@ condenses to exactly:
 3. **`bail!` / `ensure!`** — error values. bail! IS the log statement:
    construct + count + span event + log in one verb. Double-reporting
    (`log::error!` then `return Err`) is an anti-pattern the vendored
-   vendored OBSERVE.md snippet calls out by name.
+   OBSERVE.md snippet calls out by name.
 4. **`#[instrument]` / `#[all_functions]`** — zero-effort propagation
    (shift-left: one attribute instruments a whole impl block).
 5. **`error!`** — typed error definitions (codes/categories enforced at
@@ -355,7 +357,7 @@ subsystem. These are the four:
    zone, fastrace span, instant span, `scope=` field on every log record
    (ThreadLocalDiagnostic), and the `Context::Scope` auto-attached to any
    Fault raised inside it. One name, five sinks. Convention: dotted
-   `crate.phase.op` (flatland already does this organically).
+   `crate.phase.op` (consumers already do this organically).
 2. **Error code** — `error!` → registry → fault tree display (`[E100]` in
    Debug) → default log line → Diagnostic → report → doctor →
    error_counts + metrics-facade label. Grep one string, get everything.
@@ -418,8 +420,7 @@ fast_observe::error! {
 ```
 
 `#[error]` = the Display template, `#[from]`/`#[source]` = thiserror
-semantics (auto `source()` wiring kills the flatland-renderer broken-chain
-class). `#[code]` is the only thing that opts a variant into the registry /
+semantics (auto `source()` wiring kills the broken-source-chain class). `#[code]` is the only thing that opts a variant into the registry /
 doctor / report codes. `#[category]` is required whenever `#[code]` is
 present (registry entries drive policy; policy must be a decision). Uncoded
 variants behave exactly like thiserror output — that is the ramp.
@@ -437,7 +438,7 @@ variants behave exactly like thiserror output — that is the ramp.
 
 Agents that never WRITE fast-observe code still READ its output. The report
 is self-teaching: the `action:` line names concrete next steps
-("run `flatlandc doctor E100`"), and swallowed-error paths name the API
+("run `myapp doctor E100`"), and swallowed-error paths name the API
 ("intentional swallow: use `.report(msg)` so this is counted").
 Additionally the crate ships `OBSERVE.md` — a short agent guide projects
 can vendor — with a one-page translation table (the one above) so in-repo
@@ -448,18 +449,23 @@ that exists.
 
 `report::render(&Fault) -> String` (+ `_json` under `serde`). Stable
 `key: value` sections, deterministic order, no ANSI, no wall-clock,
-absolute paths. Ends with the prescriptive line:
+absolute paths. Ends with the prescriptive line.
+
+(Implemented form evolved slightly — see OBSERVE.md for the live contract:
+a `report: fast-observe/1` marker line, per-cause `[type]` + location,
+`fingerprint`, a separate `hint:` line for the runnable doctor command,
+newline-escaped values, and JSON schema 2.)
 
 ```
 error: [E100] compile error: table 'units' has no column 'hp'
 category: Content (policy: fix input; retrying unchanged input will fail)
-location: crates/flatlandc/src/analyzer.rs:214:9
-scope: flatlandc.analyze (elapsed 3.1ms)
+location: src/analyzer.rs:214:9
+scope: myapp.analyze (elapsed 3.1ms)
 cause 0: [E100] compile error: table 'units' has no column 'hp'
 cause 1: no column named 'hp' in schema 'units'
 trace_id: 4f3c9a2b…   # same id on every log line and span of this moment
 advice: check SQL syntax near the reported span
-action: fix the input and re-run; see `flatlandc doctor E100`
+action: fix the input and re-run; see `myapp doctor E100`
 ```
 
 The default error hook gains a `report` mode emitting this block as one
@@ -474,29 +480,30 @@ structured event. `OBSERVE_REPORT=json` for machine pipelines.
 | `exn.rs` | single `Frame::capture` constructor (fixes wrap_msg/walk_sources drift); attachments; `iter()`; `Coded` slot; trace-id capture point; lazy `msg` params on report/observed |
 | `errors.rs` | `error!` macro v2 alongside deprecated `define_errors!`; advice in `ErrorRegistryEntry`; `doctor()`; `Coded` trait |
 | `config.rs` | strum for all enums; `EnvConfig` parse-all-once; `OBSERVE_*` additions |
-| `hook.rs` | `init()` → thin wrapper over `observe()`; bon `Deployment` builder lives in new `deploy.rs`; hook management fns |
-| `deploy.rs` (new) | `observe()` entry, presets, `Deployment`, `InitGuard` (Drop → fastrace::flush), appender/layout/fan-out wiring |
+| `hook.rs` | `init()` → thin wrapper over `observe()`; bon `Deployment` builder lives in `deploy.rs`; hook management fns |
+| `deploy.rs` | `observe()` entry, presets, `Deployment`, `InitGuard` (Drop → fastrace::flush), appender/layout/fan-out wiring |
 | `profiling.rs` | Tier-2 forwarding in `scope!`; `function` re-export; intern table; single atomic load |
-| `report.rs` (new) | the §7 renderer, text + serde json |
+| `report.rs` | the §7 renderer, text + serde json |
 | `diagnostic.rs` | multi-label; `SourceStore`; registry-linked notes; severity ctors; NO_COLOR |
 | `lib.rs` | `prelude`; feature re-export namespace `x` |
 
-Migration for flatland: mechanical — `define_errors!` → `error!` (sed-able),
-delete `compile_err!` + size asserts + doctor printing, `init()` →
-`observe().dev()?`.
+Migration for existing consumers: mechanical — `define_errors!` → `error!`
+(sed-able), delete `compile_err!` + size asserts + doctor printing,
+`init()` → `observe().dev()?`.
 
 ---
 
 ## 9. Open decisions (pick at implementation)
 
-1. `error!` attribute syntax vs. keeping positional tuples: attributes
-   (readability, defaults, extensibility) — recommended above.
-2. Preset names: `dev/prod/test/wasm` vs. `pretty/json/…` — environment
-   names recommended (they bundle level+layout+sinks coherently).
-3. `observe()` returning builder vs. `Deployment::builder()` — `observe()`
-   (reads as the verb it is; `Deployment::builder()` remains available).
+1. `error!` attribute syntax vs. keeping positional tuples — resolved:
+   attributes (readability, defaults, extensibility); see §5.
+2. Preset names: `dev/prod/test/wasm` vs. `pretty/json/…` — resolved: no
+   environment presets at all (§2); every capability is a granular toggle.
+3. `observe()` returning builder vs. `Deployment::builder()` — resolved:
+   `observe()` (reads as the verb it is; `Deployment::builder()` remains
+   available).
 4. Whether `.report()` grows a report-mode flag or the default hook gets a
-   config knob — hook knob recommended (one place).
+   config knob — resolved: hook knob (`OBSERVE_REPORT`; one place).
 5. `From<Variant> for Fault<Enum>` is orphan-legal only because both types
    are concrete and the variant is local to the consuming crate — macro
    generates it in the consumer's crate, so fine. Confirm no coherence

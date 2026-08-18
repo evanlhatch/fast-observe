@@ -10,7 +10,8 @@
 //! 4. **Automatic error context** — `profiling!()` sets a thread-local scope
 //!    name; the error path reads it and auto-attaches `Context::Scope(name)`.
 //! 5. **`finish_frame!`** — marks a tick/frame boundary in the instant backend.
-//! 6. **`web` feature** — instant spans + browser-console logging on wasm32.
+//! 6. **`web` feature** — instant spans + browser-console logging +
+//!    devtools Performance-timeline marks on wasm32.
 //!
 //! The `scope!` / `#[all_functions]` API is compatible with upstream
 //! `profiling`.
@@ -52,6 +53,8 @@
 #[cfg(feature = "fastrace")]
 pub mod async_;
 pub(crate) mod clock;
+// Unit-carrying timestamp type — reachable as `fast_observe::profiling::Nanos`.
+pub use self::clock::Nanos;
 #[cfg(feature = "fastrace")]
 pub(crate) mod fastrace;
 #[cfg(feature = "instant")]
@@ -160,20 +163,66 @@ profiling_backend!(
     enabled = (feature = "profile-with-tracing"),
 );
 
+// Browser timeline marks (DESIGN.md §11b): the Web backend's span timing is
+// the instant backend, but on wasm32-unknown-unknown a scope ALSO emits
+// performance.mark/measure pairs. The mark guard's enter signature (name
+// only, no tag) doesn't fit `profiling_backend!`, so this wrap module is
+// hand-written with the same real/stub pattern — ZST stub off-browser, so
+// native/test behavior is unchanged.
+#[doc(hidden)]
+pub mod web_wrap {
+    #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
+    pub use super::web::{WebMarkGuard, dummy_mark, enter_mark};
+
+    #[cfg(not(all(feature = "web", target_arch = "wasm32", target_os = "unknown")))]
+    pub struct WebMarkGuard {
+        // Thread-bound marker — mirrors the real (wasm-only) guard so the
+        // stub keeps the same `!Send`/`!Sync` contract.
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+    #[cfg(not(all(feature = "web", target_arch = "wasm32", target_os = "unknown")))]
+    #[must_use]
+    pub const fn enter_mark(_name: &'static str) -> WebMarkGuard {
+        WebMarkGuard {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+    #[cfg(not(all(feature = "web", target_arch = "wasm32", target_os = "unknown")))]
+    #[must_use]
+    pub const fn dummy_mark() -> WebMarkGuard {
+        WebMarkGuard {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
 // ── Unified scope guard ────────────────────────────────────────────────────
 
 /// Guard returned by [`scope!`]. Holds one guard per backend; only backends
 /// whose bit is set in the runtime mask (and whose feature is compiled in)
 /// hold real guards — the rest are ZST stubs.
 /// Fields are never read — they exist purely for their Drop side effects.
-#[allow(dead_code, reason = "fields held only for Drop side effects")]
+/// `#[must_use]`: writing `scope!("name");` as a bare statement drops the
+/// guard immediately — a zero-length span. Bind it (`let _s = scope!(...)`).
+#[allow(
+    dead_code,
+    reason = "fields held only for Drop side effects; `_not_send` pins the guard to its creating thread"
+)]
+#[must_use = "a scope guard records on Drop — bind it (let _s = scope!(...)) or the span is zero-length"]
 pub struct ScopeGuard {
     instant: instant_wrap::InstantGuard,
+    web_mark: web_wrap::WebMarkGuard,
     fastrace: fastrace_wrap::FastraceGuard,
     puffin: puffin_wrap::PuffinGuard,
     tracy: tracy_wrap::TracyGuard,
     superluminal: superluminal_wrap::SuperluminalGuard,
     tracing: tracing_wrap::TracingGuard,
+    // Thread-bound marker: every backend guard pops a THREAD-LOCAL span
+    // stack on drop, so a cross-thread drop would corrupt the receiving
+    // thread's stack. Previously `!Send` only by accident (the `fastrace`
+    // feature pulled in an `Rc`) — `PhantomData<*const ()>` makes the
+    // `!Send`/`!Sync` contract feature-independent.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl ScopeGuard {
@@ -181,50 +230,62 @@ impl ScopeGuard {
     /// Zero allocation — the name is `'static` (a string literal).
     /// Loads the mask ONCE; `Backends::OFF` → all-dummy guard (~2ns).
     ///
-    /// `WEB` behaves like `INSTANT` for span timing; the browser-console half
-    /// of the web backend is a log appender, not a span sink.
-    #[must_use]
+    /// `WEB` behaves like `INSTANT` for span timing; additionally, on
+    /// wasm32-unknown-unknown it holds a [`web_wrap::WebMarkGuard`] that
+    /// emits `performance.mark()/measure()` pairs for the browser devtools
+    /// Performance timeline. The browser-console half of the web backend is
+    /// a log appender, not a span sink.
+    // No `#[must_use]` here — the struct itself carries the `#[must_use]`
+    // message; a method-level one is `clippy::double_must_use`.
     pub fn new_static(name: &'static str, tag: Option<&'static str>) -> Self {
         use crate::config::Backends;
         let mask = crate::config::config().backends();
-        Self {
-            instant: if mask.contains(Backends::INSTANT) || mask.contains(Backends::WEB) {
-                instant_wrap::enter(name, tag)
-            } else {
-                instant_wrap::dummy()
-            },
-            fastrace: if mask.contains(Backends::FASTRACE) {
-                fastrace_wrap::enter(name, tag)
-            } else {
-                fastrace_wrap::dummy()
-            },
-            puffin: if mask.contains(Backends::PUFFIN) {
-                puffin_wrap::enter(name, tag)
-            } else {
-                puffin_wrap::dummy()
-            },
-            tracy: if mask.contains(Backends::TRACY) {
-                tracy_wrap::enter(name, tag)
-            } else {
-                tracy_wrap::dummy()
-            },
-            superluminal: if mask.contains(Backends::SUPERLUMINAL) {
-                superluminal_wrap::enter(name, tag)
-            } else {
-                superluminal_wrap::dummy()
-            },
-            tracing: if mask.contains(Backends::TRACING) {
-                tracing_wrap::enter(name, tag)
-            } else {
-                tracing_wrap::dummy()
-            },
+
+        // Pure DRY: one repetition over the backends whose enter/dummy
+        // signatures match exactly (`name` + `tag`) — per field it emits the
+        // uniform `if mask.contains(Backends::…) { enter(name, tag) } else {
+        // dummy() }` initializer. `instant` and `web_mark` stay written
+        // explicitly — they have special predicates/signatures (INSTANT|WEB
+        // split, name-only mark signature).
+        //
+        // NOTE: a `macro_rules!` call cannot expand to a struct-LITERAL field
+        // (rustc limitation — the struct parser rejects `ident!` in field
+        // position), so the macro emits the complete `Self { .. }` literal.
+        macro_rules! backend_guard_field {
+            ($(($field:ident, $backend:ident, $wrap:ident)),* $(,)?) => {
+                Self {
+                    instant: if mask.contains(Backends::INSTANT) || mask.contains(Backends::WEB) {
+                        instant_wrap::enter(name, tag)
+                    } else {
+                        instant_wrap::dummy()
+                    },
+                    web_mark: if mask.contains(Backends::WEB) {
+                        web_wrap::enter_mark(name)
+                    } else {
+                        web_wrap::dummy_mark()
+                    },
+                    $($field: if mask.contains(Backends::$backend) {
+                        $wrap::enter(name, tag)
+                    } else {
+                        $wrap::dummy()
+                    },)*
+                    _not_send: PhantomData,
+                }
+            };
+        }
+        backend_guard_field! {
+            (fastrace, FASTRACE, fastrace_wrap),
+            (puffin, PUFFIN, puffin_wrap),
+            (tracy, TRACY, tracy_wrap),
+            (superluminal, SUPERLUMINAL, superluminal_wrap),
+            (tracing, TRACING, tracing_wrap),
         }
     }
 
     /// Enter a scope with a dynamic name. Interns the string to satisfy
     /// `&'static str` — repeated calls with the same name share one leaked
     /// copy. Cold path — only called from dynamic scope creation (rare).
-    #[must_use]
+    // `#[must_use]` inherited from the struct (see `new_static`).
     pub fn new(name: &str, tag: Option<&str>) -> Self {
         Self::new_static(intern(name), tag.map(intern))
     }
@@ -233,6 +294,12 @@ impl ScopeGuard {
 /// Intern a dynamic scope name: return the existing leaked copy if present,
 /// else leak once and insert. Bounded by the number of unique dynamic names
 /// (~50 bytes each).
+///
+/// The bound covers unique dynamic scope NAMES *and TAGS* — [`ScopeGuard::new`]
+/// interns both. A high-cardinality dynamic tag (request IDs, user IDs)
+/// grows the leak without bound, so `ScopeGuard::new` is for low-cardinality
+/// names/tags only; use [`enter_function_scope`] (`Cow::Owned`, no leak) for
+/// dynamic function-scope names instead.
 pub(crate) fn intern(s: &str) -> &'static str {
     static INTERN: LazyLock<Mutex<HashSet<&'static str>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -291,6 +358,10 @@ macro_rules! root_span {
 // ── profiling! ────────────────────────────────────────────────────────────────
 
 #[macro_export]
+/// Enter a function scope named by `func_path!()` — the `profiling`-crate
+/// compatibility form of `function_scope!()`. Pushes the thread-local scope
+/// stack and sets the logforth `scope` diagnostic; the guard pops both on
+/// drop. See [`enter_function_scope`].
 macro_rules! profiling {
     () => {
         let _func_scope = $crate::profiling::enter_function_scope(::std::borrow::Cow::Borrowed(
@@ -306,6 +377,9 @@ macro_rules! profiling {
 }
 
 #[macro_export]
+/// The full `module::path::fn_name` of the enclosing function — the same
+/// heuristic `profiling` uses (a zero-size local struct's `type_name` minus
+/// the trailing `::S`).
 macro_rules! func_path {
     () => {{
         struct S;
@@ -315,6 +389,8 @@ macro_rules! func_path {
 }
 
 #[macro_export]
+/// Enter a function scope for the enclosing function (alias of
+/// [`profiling!`] with identical semantics).
 macro_rules! function_scope {
     () => {
         $crate::profiling!()
@@ -350,6 +426,7 @@ macro_rules! finish_frame {
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
@@ -358,6 +435,38 @@ use self::clock::Instant;
 
 thread_local! {
     pub(crate) static CURRENT_SCOPE: RefCell<Vec<(Cow<'static, str>, Instant)>> = const { RefCell::new(Vec::new()) };
+    /// Cache of the last value written to the logforth `scope` diagnostic.
+    /// logforth's `ThreadLocalDiagnostic::insert` is `Into<String>` over a
+    /// `BTreeMap<String, String>` (~2 `String` allocations per call) — the
+    /// hot path (`profiling!()` on every function entry) must not
+    /// re-allocate when the value is unchanged.
+    static LAST_SCOPE_DIAGNOSTIC: RefCell<Option<Cow<'static, str>>> = const { RefCell::new(None) };
+}
+
+/// Set the logforth `scope` diagnostic, skipping the logforth call when the
+/// cached value already equals `name` (see [`LAST_SCOPE_DIAGNOSTIC`]).
+/// `None` removes the key (skipped too when the cache is already `None`).
+/// Silently skips during TLS teardown: this runs from
+/// [`FunctionScopeGuard::drop`], where a `LocalKey::with` panic inside
+/// `Drop` would abort the process during unwinding.
+fn set_scope_diagnostic(name: Option<&str>) {
+    let changed = LAST_SCOPE_DIAGNOSTIC
+        .try_with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.as_deref() == name {
+                return false;
+            }
+            *cache = name.map(|n| Cow::Owned(n.to_owned()));
+            true
+        })
+        .unwrap_or(false);
+    if !changed {
+        return;
+    }
+    match name {
+        Some(n) => logforth::diagnostic::ThreadLocalDiagnostic::insert("scope", n),
+        None => logforth::diagnostic::ThreadLocalDiagnostic::remove("scope"),
+    }
 }
 
 /// Enter a function scope — pushes `(name, now)` onto the thread-local scope
@@ -371,8 +480,10 @@ thread_local! {
 )]
 pub fn enter_function_scope(name: Cow<'static, str>) -> FunctionScopeGuard {
     CURRENT_SCOPE.with(|s| s.borrow_mut().push((name.clone(), Instant::now())));
-    logforth::diagnostic::ThreadLocalDiagnostic::insert("scope", name.as_ref());
-    FunctionScopeGuard
+    set_scope_diagnostic(Some(name.as_ref()));
+    FunctionScopeGuard {
+        _not_send: PhantomData,
+    }
 }
 
 /// Enter a function scope with a tag. The tag is appended to the scope name.
@@ -396,21 +507,26 @@ pub fn enter_function_scope_with_tag(
 /// code, so `pop()` removes exactly this guard's entry. An out-of-order drop
 /// (e.g. a `mem::forget`ed guard dropped later) pops whatever entry is on
 /// top — same LIFO discipline as the instant span stack; don't leak guards.
-pub struct FunctionScopeGuard;
+pub struct FunctionScopeGuard {
+    // Thread-bound marker: drop pops the THREAD-LOCAL scope stack, so a
+    // cross-thread drop would pop the receiving thread's stack —
+    // `PhantomData<*const ()>` makes that a compile error.
+    _not_send: PhantomData<*const ()>,
+}
 
 impl Drop for FunctionScopeGuard {
     fn drop(&mut self) {
-        let parent = CURRENT_SCOPE.with(|s| {
+        // TLS teardown: the scope stack may already be destroyed — skip
+        // silently. `LocalKey::with` panics in that state, and a panic
+        // inside `Drop` during unwinding aborts the process.
+        let Ok(parent) = CURRENT_SCOPE.try_with(|s| {
             let mut stack = s.borrow_mut();
             stack.pop();
             stack.last().map(|(name, _)| name.clone())
-        });
-        match parent {
-            Some(name) => {
-                logforth::diagnostic::ThreadLocalDiagnostic::insert("scope", name.as_ref());
-            }
-            None => logforth::diagnostic::ThreadLocalDiagnostic::remove("scope"),
-        }
+        }) else {
+            return;
+        };
+        set_scope_diagnostic(parent.as_deref());
     }
 }
 

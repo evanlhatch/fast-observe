@@ -10,7 +10,7 @@ use proc_macro2::{Ident, Literal, Span, TokenStream as TokenStream2, TokenTree};
 use quote::{ToTokens, quote};
 use venial::{Attribute, AttributeValue, Enum, EnumVariant, Fields, Item, NamedField, TupleField};
 
-use crate::{error_at, error_at_tokens};
+use crate::{error_at, error_at_tokens, venial_error};
 
 /// Default byte budget for the generated enum (`#[max_size = N]` overrides).
 const DEFAULT_MAX_SIZE: usize = 64;
@@ -22,6 +22,7 @@ struct VariantMeta {
     code: Option<Literal>,
     category: Option<Ident>,
     advice: Option<Literal>,
+    action: Option<Literal>,
     from: bool,
 }
 
@@ -35,6 +36,9 @@ struct Variant {
     category: Option<Ident>,
     /// Explicit `#[advice]`, else the first doc-comment line.
     advice: Option<Literal>,
+    /// Explicit `#[action = "..."]` — overrides the policy line in the
+    /// report's `action:` section.
+    action: Option<Literal>,
     from: bool,
     kind: Kind,
     /// `#[source]`-marked or named-`source` field of a struct variant.
@@ -50,6 +54,52 @@ enum Kind {
 /// True for single-segment attributes named `name` (`#[name ...]`).
 fn attr_is(attr: &Attribute, name: &str) -> bool {
     matches!(attr.path.as_slice(), [TokenTree::Ident(ident)] if ident == name)
+}
+
+/// The value tokens of an `= ...` attribute, or one diagnostic.
+fn expect_eq_value<'a>(
+    attr: &'a Attribute,
+    expected: &str,
+    errors: &mut Vec<TokenStream2>,
+) -> Option<&'a [TokenTree]> {
+    match &attr.value {
+        AttributeValue::Equals(_, tokens) => Some(tokens.as_slice()),
+        _ => {
+            errors.push(error_at_tokens(&attr.to_token_stream(), expected));
+            None
+        }
+    }
+}
+
+/// Token types usable as a `set_once` value: span-carrying (Literal, Ident).
+trait ValueSpan {
+    fn value_span(&self) -> Span;
+}
+
+impl ValueSpan for Literal {
+    fn value_span(&self) -> Span {
+        self.span()
+    }
+}
+
+impl ValueSpan for Ident {
+    fn value_span(&self) -> Span {
+        self.span()
+    }
+}
+
+/// One generic duplicate-checked slot setter (replaces the per-field
+/// set_tpl/set_code/set_category/set_advice/set_action bodies). `name`
+/// completes the `duplicate \`{name}\`` diagnostic, spanned to the new value.
+fn set_once<T: Clone + ValueSpan>(
+    slot: &mut Option<T>,
+    value: T,
+    name: &str,
+    errors: &mut Vec<TokenStream2>,
+) {
+    if slot.replace(value.clone()).is_some() {
+        errors.push(error_at(value.value_span(), &format!("duplicate `{name}`")));
+    }
 }
 
 /// The `#[cfg]` / `#[cfg_attr]` subset of `attrs` — forwarded onto generated
@@ -80,48 +130,48 @@ fn unquote(lit: &Literal) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// True when the template is thiserror's `#[error(transparent)]` — Display
+/// and `source()` both delegate to the single inner field.
+fn is_transparent_tpl(tpl: &Literal) -> bool {
+    unquote(tpl).as_deref() == Some("transparent")
+}
+
 /// The first non-empty doc-comment line, trimmed — the default advice text.
 fn first_doc_line(attrs: &[Attribute]) -> Option<Literal> {
     for attr in attrs {
         if !attr_is(attr, "doc") {
             continue;
         }
-        if let AttributeValue::Equals(_, tokens) = &attr.value {
-            if let Some(TokenTree::Literal(lit)) = tokens.first() {
-                if let Some(text) = unquote(lit) {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        return Some(Literal::string(trimmed));
-                    }
-                }
-            }
+        if let AttributeValue::Equals(_, tokens) = &attr.value
+            && let Some(TokenTree::Literal(lit)) = tokens.first()
+            && let Some(text) = unquote(lit)
+            && let trimmed = text.trim()
+            && !trimmed.is_empty()
+        {
+            return Some(Literal::string(trimmed));
         }
     }
     None
 }
 
 fn set_tpl(meta: &mut VariantMeta, lit: Literal, errors: &mut Vec<TokenStream2>) {
-    if meta.tpl.replace(lit.clone()).is_some() {
-        errors.push(error_at(lit.span(), "duplicate `#[error]`"));
-    }
+    set_once(&mut meta.tpl, lit, "#[error]", errors);
 }
 
 fn set_code(meta: &mut VariantMeta, lit: Literal, errors: &mut Vec<TokenStream2>) {
-    if meta.code.replace(lit.clone()).is_some() {
-        errors.push(error_at(lit.span(), "duplicate `code`"));
-    }
+    set_once(&mut meta.code, lit, "code", errors);
 }
 
 fn set_category(meta: &mut VariantMeta, cat: Ident, errors: &mut Vec<TokenStream2>) {
-    if meta.category.replace(cat.clone()).is_some() {
-        errors.push(error_at(cat.span(), "duplicate `category`"));
-    }
+    set_once(&mut meta.category, cat, "category", errors);
 }
 
 fn set_advice(meta: &mut VariantMeta, lit: Literal, errors: &mut Vec<TokenStream2>) {
-    if meta.advice.replace(lit.clone()).is_some() {
-        errors.push(error_at(lit.span(), "duplicate `advice`"));
-    }
+    set_once(&mut meta.advice, lit, "advice", errors);
+}
+
+fn set_action(meta: &mut VariantMeta, lit: Literal, errors: &mut Vec<TokenStream2>) {
+    set_once(&mut meta.action, lit, "action", errors);
 }
 
 /// Parse the `= "E001", category = Content, advice = "..."` tail of `#[code]`.
@@ -169,9 +219,10 @@ fn parse_code_tail(tokens: &[TokenTree], meta: &mut VariantMeta, errors: &mut Ve
         match (key.to_string().as_str(), iter.next()) {
             ("category", Some(TokenTree::Ident(cat))) => set_category(meta, cat.clone(), errors),
             ("advice", Some(TokenTree::Literal(lit))) => set_advice(meta, lit.clone(), errors),
+            ("action", Some(TokenTree::Literal(lit))) => set_action(meta, lit.clone(), errors),
             (_, Some(tt)) => errors.push(error_at(
                 tt.span(),
-                "expected `category = <Ident>` or `advice = \"...\"`",
+                "expected `category = <Ident>` | `advice = \"...\"` | `action = \"...\"`",
             )),
             (_, None) => errors.push(error_at(key.span(), "missing value after `=`")),
         }
@@ -180,17 +231,16 @@ fn parse_code_tail(tokens: &[TokenTree], meta: &mut VariantMeta, errors: &mut Ve
 
 /// Parse `#[max_size = 128]` on the enum.
 fn parse_max_size(attr: &Attribute) -> Result<usize, TokenStream2> {
-    if let AttributeValue::Equals(_, tokens) = &attr.value {
-        if let Some(TokenTree::Literal(lit)) = tokens.first() {
-            let digits: String = lit
-                .to_string()
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            if let Ok(n) = digits.parse::<usize>() {
-                return Ok(n);
-            }
-        }
+    if let AttributeValue::Equals(_, tokens) = &attr.value
+        && let Some(TokenTree::Literal(lit)) = tokens.first()
+        && let digits = lit
+            .to_string()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+        && let Ok(n) = digits.parse::<usize>()
+    {
+        return Ok(n);
     }
     Err(error_at_tokens(
         &attr.to_token_stream(),
@@ -199,7 +249,11 @@ fn parse_max_size(attr: &Attribute) -> Result<usize, TokenStream2> {
 }
 
 /// Strip + interpret the macro attributes of one variant and validate it.
-fn parse_variant(v: &EnumVariant, errors: &mut Vec<TokenStream2>) -> Variant {
+fn parse_variant(
+    v: &EnumVariant,
+    errors: &mut Vec<TokenStream2>,
+    default_category: Option<&Ident>,
+) -> Variant {
     let mut meta = VariantMeta::default();
     let mut forward_attrs = Vec::new();
 
@@ -225,36 +279,33 @@ fn parse_variant(v: &EnumVariant, errors: &mut Vec<TokenStream2>) -> Variant {
                 )),
             }
         } else if attr_is(attr, "code") {
-            match &attr.value {
-                AttributeValue::Equals(_, tokens) => parse_code_tail(tokens, &mut meta, errors),
-                _ => errors.push(error_at_tokens(
-                    &attr.to_token_stream(),
-                    "expected `#[code = \"E123\", category = ...]`",
-                )),
-            }
+            let Some(tokens) = expect_eq_value(
+                attr,
+                "expected `#[code = \"E123\", category = ...]`",
+                errors,
+            ) else {
+                continue;
+            };
+            parse_code_tail(tokens, &mut meta, errors);
         } else if attr_is(attr, "advice") {
-            match &attr.value {
-                AttributeValue::Equals(_, tokens) => match tokens.first() {
-                    Some(TokenTree::Literal(lit)) => set_advice(&mut meta, lit.clone(), errors),
-                    _ => errors.push(error_at_tokens(
-                        &attr.to_token_stream(),
-                        "expected `#[advice = \"...\"]`",
-                    )),
-                },
+            let Some(tokens) = expect_eq_value(attr, "expected `#[advice = \"...\"]`", errors)
+            else {
+                continue;
+            };
+            match tokens.first() {
+                Some(TokenTree::Literal(lit)) => set_advice(&mut meta, lit.clone(), errors),
                 _ => errors.push(error_at_tokens(
                     &attr.to_token_stream(),
                     "expected `#[advice = \"...\"]`",
                 )),
             }
         } else if attr_is(attr, "category") {
-            match &attr.value {
-                AttributeValue::Equals(_, tokens) => match tokens.first() {
-                    Some(TokenTree::Ident(cat)) => set_category(&mut meta, cat.clone(), errors),
-                    _ => errors.push(error_at_tokens(
-                        &attr.to_token_stream(),
-                        "expected `#[category = <Category>]`",
-                    )),
-                },
+            let Some(tokens) = expect_eq_value(attr, "expected `#[category = <Category>]`", errors)
+            else {
+                continue;
+            };
+            match tokens.first() {
+                Some(TokenTree::Ident(cat)) => set_category(&mut meta, cat.clone(), errors),
                 _ => errors.push(error_at_tokens(
                     &attr.to_token_stream(),
                     "expected `#[category = <Category>]`",
@@ -266,6 +317,18 @@ fn parse_variant(v: &EnumVariant, errors: &mut Vec<TokenStream2>) -> Variant {
                 _ => errors.push(error_at_tokens(
                     &attr.to_token_stream(),
                     "`#[from]` takes no arguments",
+                )),
+            }
+        } else if attr_is(attr, "action") {
+            let Some(tokens) = expect_eq_value(attr, "expected `#[action = \"...\"]`", errors)
+            else {
+                continue;
+            };
+            match tokens.first() {
+                Some(TokenTree::Literal(lit)) => set_action(&mut meta, lit.clone(), errors),
+                _ => errors.push(error_at_tokens(
+                    &attr.to_token_stream(),
+                    "expected `#[action = \"...\"]`",
                 )),
             }
         } else {
@@ -284,11 +347,39 @@ fn parse_variant(v: &EnumVariant, errors: &mut Vec<TokenStream2>) -> Variant {
             ),
         ));
     }
+    // Registry lookup-key shape: `^[A-Z]+[0-9]+$` (e.g. "E100"). Skip
+    // silently when the literal isn't a plain quoted string (unquote: None).
+    if let Some(code) = &meta.code
+        && let Some(text) = unquote(code)
+    {
+        let split = text
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(text.len());
+        let (letters, digits) = text.split_at(split);
+        let valid = !letters.is_empty()
+            && letters.chars().all(|c| c.is_ascii_uppercase())
+            && !digits.is_empty()
+            && digits.chars().all(|c| c.is_ascii_digit());
+        if !valid {
+            errors.push(error_at(
+                code.span(),
+                &format!("error code must match `PREFIX+digits` (e.g. \"E100\") — got \"{text}\""),
+            ));
+        }
+    }
     match (&meta.code, &meta.category) {
-        (Some(code), None) => errors.push(error_at(
-            code.span(),
-            "`#[code]` requires `category = <Content|Invariant|Transient|Fatal>`",
-        )),
+        (Some(_), None) => {
+            // The enum-level `#[category]` default fills the gap.
+            if let Some(default) = default_category {
+                meta.category = Some(default.clone());
+            } else {
+                errors.push(error_at(
+                    v.name.span(),
+                    "`#[code]` requires `category = <Content|Invariant|Transient|Fatal>` \
+                     (or an enum-level `#[category]` default)",
+                ));
+            }
+        }
         (None, Some(cat)) => errors.push(error_at(
             cat.span(),
             "`category` requires `#[code]` — uncoded variants take neither",
@@ -333,6 +424,23 @@ fn parse_variant(v: &EnumVariant, errors: &mut Vec<TokenStream2>) -> Variant {
         source_field = marked.first().map(|ident| (*ident).clone());
     }
 
+    // `#[error(transparent)]` shape check: exactly one delegated field.
+    // (A lone struct field becomes the source even without the marker.)
+    if let Some(tpl) = &meta.tpl
+        && is_transparent_tpl(tpl)
+    {
+        match &kind {
+            Kind::Tuple(fields) if fields.len() == 1 => {}
+            Kind::Struct(fields) if fields.len() == 1 => {
+                source_field = source_field.or_else(|| fields.first().map(|f| f.name.clone()));
+            }
+            _ => errors.push(error_at(
+                tpl.span(),
+                "`#[error(transparent)]` requires a single-field tuple or a single-field struct variant",
+            )),
+        }
+    }
+
     let advice = meta.advice.or_else(|| first_doc_line(&v.attributes));
 
     Variant {
@@ -342,6 +450,7 @@ fn parse_variant(v: &EnumVariant, errors: &mut Vec<TokenStream2>) -> Variant {
         code: meta.code,
         category: meta.category,
         advice,
+        action: meta.action,
         from: meta.from,
         kind,
         source_field,
@@ -370,6 +479,10 @@ fn entry_expr(v: &Variant) -> Option<TokenStream2> {
         Some(lit) => quote!(::core::option::Option::Some(#lit)),
         None => quote!(::core::option::Option::None),
     };
+    let action = match &v.action {
+        Some(lit) => quote!(::core::option::Option::Some(#lit)),
+        None => quote!(::core::option::Option::None),
+    };
     Some(quote! {
         ::fast_observe::ErrorRegistryEntry {
             code: #code,
@@ -377,6 +490,7 @@ fn entry_expr(v: &Variant) -> Option<TokenStream2> {
             category: ::fast_observe::ErrorCategory::#cat,
             display: #tpl,
             advice: #advice,
+            action: #action,
             module: ::core::module_path!(),
         }
     })
@@ -476,6 +590,17 @@ fn codegen(
                 // already lists `Debug`.
                 let debug_derive =
                     (!attrs.iter().any(derive_has_debug)).then(|| quote!(#[derive(Debug)]));
+                // `#[error(transparent)]`: Display delegates to the inner
+                // field instead of formatting a template.
+                let display_body = if is_transparent_tpl(tpl) {
+                    let sf = v
+                        .source_field
+                        .as_ref()
+                        .expect("transparent struct variant validated to have a source field");
+                    quote!(::core::fmt::Display::fmt(&self.#sf, f))
+                } else {
+                    quote!(::core::write!(f, #tpl #(, #fnames = self.#fnames)*))
+                };
                 out.extend(quote! {
                     #(#attrs)*
                     #debug_derive
@@ -486,7 +611,7 @@ fn codegen(
                     #(#cfgs)*
                     impl ::core::fmt::Display for #vname {
                         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                            ::core::write!(f, #tpl #(, #fnames = self.#fnames)*)
+                            #display_body
                         }
                     }
 
@@ -576,7 +701,12 @@ fn codegen(
                     let binds: Vec<Ident> = (0..fields.len())
                         .map(|i| Ident::new(&format!("__fo_{i}"), Span::call_site()))
                         .collect();
-                    quote!(Self::#vname(#(#binds),*) => ::core::write!(f, #tpl #(, #binds)*))
+                    if is_transparent_tpl(tpl) {
+                        // Transparent is validated single-field: bind one.
+                        quote!(Self::#vname(b0) => ::core::fmt::Display::fmt(&b0, f))
+                    } else {
+                        quote!(Self::#vname(#(#binds),*) => ::core::write!(f, #tpl #(, #binds)*))
+                    }
                 }
                 Kind::Unit => quote!(Self::#vname => ::core::write!(f, #tpl)),
             };
@@ -605,6 +735,10 @@ fn codegen(
                         quote!(Self::#vname(v) => ::core::error::Error::source(v))
                     }
                     Kind::Tuple(fields) if v.from && fields.len() == 1 => {
+                        quote!(Self::#vname(e) => ::core::option::Option::Some(e))
+                    }
+                    Kind::Tuple(_) if v.tpl.as_ref().is_some_and(is_transparent_tpl) => {
+                        // Transparent is validated single-field.
                         quote!(Self::#vname(e) => ::core::option::Option::Some(e))
                     }
                     Kind::Tuple(_) => {
@@ -772,7 +906,7 @@ pub(crate) fn expand(input: TokenStream2) -> TokenStream2 {
     let parsed = match venial::parse_item(input.clone()) {
         Ok(parsed) => parsed,
         Err(err) => {
-            errors.push(err.to_compile_error());
+            errors.push(venial_error(err));
             return append_errors(input, errors);
         }
     };
@@ -800,14 +934,35 @@ pub(crate) fn expand(input: TokenStream2) -> TokenStream2 {
         ));
     }
 
-    // Enum-level attributes: `#[max_size = N]` consumed, the rest forwarded.
+    // Enum-level attributes: `#[max_size = N]` and `#[category = ...]`
+    // consumed, the rest forwarded.
     let mut max_size = DEFAULT_MAX_SIZE;
+    let mut enum_category: Option<Ident> = None;
     let mut enum_attrs = Vec::new();
     for attr in &en.attributes {
         if attr_is(attr, "max_size") {
             match parse_max_size(attr) {
                 Ok(n) => max_size = n,
                 Err(err) => errors.push(err),
+            }
+        } else if attr_is(attr, "category") {
+            let Some(tokens) = expect_eq_value(
+                attr,
+                "expected `#[category = <Category>]` on the enum",
+                &mut errors,
+            ) else {
+                continue;
+            };
+            match tokens.first() {
+                Some(TokenTree::Ident(cat)) => {
+                    if enum_category.replace(cat.clone()).is_some() {
+                        errors.push(error_at(cat.span(), "duplicate enum-level `#[category]`"));
+                    }
+                }
+                _ => errors.push(error_at_tokens(
+                    &attr.to_token_stream(),
+                    "expected `#[category = <Category>]` on the enum",
+                )),
             }
         } else {
             enum_attrs.push(attr.clone());
@@ -817,19 +972,19 @@ pub(crate) fn expand(input: TokenStream2) -> TokenStream2 {
     let variants: Vec<Variant> = en
         .variants
         .items()
-        .map(|v| parse_variant(v, &mut errors))
+        .map(|v| parse_variant(v, &mut errors, enum_category.as_ref()))
         .collect();
 
     // ── Cross-variant validation ──────────────────────────────────────────
     let mut seen_codes: HashMap<String, ()> = HashMap::new();
     for v in &variants {
-        if let Some(code) = &v.code {
-            if seen_codes.insert(code.to_string(), ()).is_some() {
-                errors.push(error_at(
-                    code.span(),
-                    &format!("duplicate error code {code} within this enum"),
-                ));
-            }
+        if let Some(code) = &v.code
+            && seen_codes.insert(code.to_string(), ()).is_some()
+        {
+            errors.push(error_at(
+                code.span(),
+                &format!("duplicate error code {code} within this enum"),
+            ));
         }
     }
     let mut from_types: HashMap<String, Ident> = HashMap::new();
@@ -837,19 +992,18 @@ pub(crate) fn expand(input: TokenStream2) -> TokenStream2 {
         if !v.from {
             continue;
         }
-        if let Kind::Tuple(fields) = &v.kind {
-            if let Some(field) = fields.first() {
-                let key = field.ty.to_token_stream().to_string();
-                if let Some(first) = from_types.insert(key, v.name.clone()) {
-                    errors.push(error_at(
-                        v.name.span(),
-                        &format!(
-                            "multiple `#[from]` variants with the same inner type (first: \
-                             `{first}`) — rustc would reject the overlapping `From` impls"
-                        ),
-                    ));
-                }
-            }
+        if let Kind::Tuple(fields) = &v.kind
+            && let Some(field) = fields.first()
+            && let key = field.ty.to_token_stream().to_string()
+            && let Some(first) = from_types.insert(key, v.name.clone())
+        {
+            errors.push(error_at(
+                v.name.span(),
+                &format!(
+                    "multiple `#[from]` variants with the same inner type (first: \
+                     `{first}`) — rustc would reject the overlapping `From` impls"
+                ),
+            ));
         }
     }
 

@@ -1,11 +1,14 @@
 ---
 source: tests/report_snapshot.rs
-expression: redact_location(&render_report(&fault))
+expression: redact_volatile(&render_report(&fault))
 ---
-error: [E999] snap boom (loading snapshot)
+report: fast-observe/1
+error: [E999] [report_snapshot::SnapBoom] snap boom (loading snapshot)
 category: Content (policy: fix the input; retrying unchanged input will fail)
 location: [LOCATION]
 attachment: attempt=3
-cause 0: [E999] snap boom (loading snapshot)
-cause 1: snap leaf blew up
-action: fix the input; retrying unchanged input will fail; see `doctor E999`
+cause 0: [E999] [report_snapshot::SnapBoom] snap boom (loading snapshot), at [LOCATION]
+cause 1: snap leaf blew up, at [LOCATION]
+fingerprint: [FINGERPRINT]
+action: fix the input; retrying unchanged input will fail
+hint: run `doctor E999`

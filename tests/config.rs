@@ -1,5 +1,4 @@
 //! Config: backend-set selection roundtrips, throttle, global config restore.
-//! (See MIGRATING.md for provenance.)
 
 use fast_observe::config::{Backends, ObserveConfig, config};
 

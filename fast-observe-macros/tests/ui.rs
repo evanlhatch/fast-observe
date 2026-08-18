@@ -14,5 +14,9 @@ fn ui() {
     t.compile_fail("tests/ui/category_without_code.rs");
     t.compile_fail("tests/ui/missing_error_attr.rs");
     t.compile_fail("tests/ui/duplicate_codes.rs");
+    t.compile_fail("tests/ui/invalid_code_format.rs");
     t.compile_fail("tests/ui/from_on_struct_variant.rs");
+    t.pass("tests/ui/main_ok.rs");
+    t.pass("tests/ui/main_alias.rs");
+    t.pass("tests/ui/main_std_path.rs");
 }

@@ -121,22 +121,17 @@ impl std::fmt::Display for ProfiledRun {
 
 /// Aggregate spans by name: total/calls/avg, sorted by total descending.
 ///
-/// Duplicates `breakdown::print_tree`'s grouping (~15 lines) — that one
-/// prints to stdout; this one returns the data for [`ProfiledRun`].
-/// `breakdown.rs` is not editable from here; keep the two in sync manually.
+/// Groups via the canonical [`instant::group_by_name`] pass (shared with
+/// `breakdown::print_tree` — one grouping, two renderings), then sums each
+/// name's durations into a [`SpanAgg`].
 fn aggregate(spans: &[SpanRecord]) -> Vec<SpanAgg> {
-    let mut groups: std::collections::BTreeMap<&'static str, (u128, u64)> =
-        std::collections::BTreeMap::new();
-    for s in spans {
-        let e = groups.entry(s.name).or_default();
-        e.0 += s.duration().as_nanos();
-        e.1 += 1;
-    }
+    let groups = instant::group_by_name(spans);
     let mut out: Vec<SpanAgg> = groups
         .into_iter()
-        .map(|(name, (total_ns, calls))| {
-            let total_ns = u64::try_from(total_ns).unwrap_or(u64::MAX);
-            let total = Duration::from_nanos(total_ns);
+        .map(|(name, durations)| {
+            let total_ns: u128 = durations.iter().map(Duration::as_nanos).sum();
+            let calls = durations.len() as u64;
+            let total = Duration::from_nanos(u64::try_from(total_ns).unwrap_or(u64::MAX));
             // calls fits u32 in any real run; saturate rather than truncate.
             let divisor = u32::try_from(calls).unwrap_or(u32::MAX);
             SpanAgg {
@@ -178,19 +173,15 @@ impl Drop for Restore {
     }
 }
 
-/// Run `f` `iterations` times with the instant span accumulator enabled,
-/// then return the aggregated per-phase breakdown.
-///
-/// The standalone (non-divan) counterpart of [`BenchExt::bench_profiled`] —
-/// same force/clear/drain/aggregate sequence, useful in unit tests and
-/// ad-hoc timing. The previous backend set is restored afterwards, even on
-/// panic.
+/// The single force/clear/run/drain/aggregate sequence behind
+/// [`measure_breakdown`] and [`BenchExt::bench_profiled`] — one code path,
+/// two drivers (a fixed-iteration loop, divan's sample loop). The previous
+/// backend set is restored afterwards, even on panic.
 ///
 /// Concurrency caveat: the backend mask is process-global while span storage
 /// is thread-local. Concurrent callers (parallel tests) can restore the mask
 /// under each other and silently stop span recording — serialize callers.
-#[must_use]
-pub fn measure_breakdown(iterations: usize, mut f: impl FnMut()) -> ProfiledRun {
+fn run_profiled(run: impl FnOnce()) -> ProfiledRun {
     let cfg = config();
     let saved = cfg.backends();
     cfg.set_backends(saved | Backends::INSTANT);
@@ -198,9 +189,7 @@ pub fn measure_breakdown(iterations: usize, mut f: impl FnMut()) -> ProfiledRun 
     let errors_before = crate::error_counts();
     instant::clear();
 
-    for _ in 0..iterations {
-        f();
-    }
+    run();
 
     let spans = instant::drain();
     let errors_after = crate::error_counts();
@@ -208,6 +197,20 @@ pub fn measure_breakdown(iterations: usize, mut f: impl FnMut()) -> ProfiledRun 
         spans: aggregate(&spans),
         errors_delta: error_delta(&errors_before, errors_after),
     }
+}
+
+/// Run `f` `iterations` times with the instant span accumulator enabled,
+/// then return the aggregated per-phase breakdown.
+///
+/// The standalone (non-divan) counterpart of [`BenchExt::bench_profiled`] —
+/// see [`run_profiled`] for the shared sequence and its concurrency caveat.
+#[must_use]
+pub fn measure_breakdown(iterations: usize, mut f: impl FnMut()) -> ProfiledRun {
+    run_profiled(|| {
+        for _ in 0..iterations {
+            f();
+        }
+    })
 }
 
 /// Extension methods for [`divan::Bencher`].
@@ -243,20 +246,8 @@ pub trait BenchExt {
 impl __seal_bench_ext::Sealed for divan::Bencher<'_, '_> {}
 impl BenchExt for divan::Bencher<'_, '_> {
     fn bench_profiled<T>(self, f: impl FnMut() -> T) -> ProfiledRun {
-        let cfg = config();
-        let saved = cfg.backends();
-        cfg.set_backends(saved | Backends::INSTANT);
-        let _restore = Restore(saved);
-        let errors_before = crate::error_counts();
-        instant::clear();
-
-        self.bench_local(f);
-
-        let spans = instant::drain();
-        let errors_after = crate::error_counts();
-        ProfiledRun {
-            spans: aggregate(&spans),
-            errors_delta: error_delta(&errors_before, errors_after),
-        }
+        run_profiled(|| {
+            self.bench_local(f);
+        })
     }
 }

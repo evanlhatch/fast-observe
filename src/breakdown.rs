@@ -30,11 +30,9 @@ fn print_tree(spans: &[SpanRecord]) {
     use nu_ansi_term::Color;
     use std::time::Duration;
 
-    let mut groups: std::collections::BTreeMap<&str, Vec<Duration>> =
-        std::collections::BTreeMap::new();
-    for s in spans {
-        groups.entry(s.name).or_default().push(s.duration());
-    }
+    // One shared group-by-name pass (`instant::group_by_name`); `bench`
+    // uses the same helper and sums instead of formatting.
+    let groups = crate::profiling::instant::group_by_name(spans);
 
     println!("\n  SPAN BREAKDOWN ({} spans):", spans.len());
     let mut sorted: Vec<_> = groups.iter().collect();

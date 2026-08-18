@@ -12,8 +12,12 @@
 //!   fastrace span that is entered on every poll, so the span follows the
 //!   task across threads and suspension points.
 //! - [`extract_traceparent`] / [`inject_traceparent`] — W3C
-//!   `traceparent` propagation helpers (DESIGN.md §11b), thin wrappers over
-//!   fastrace's codec.
+//!   `traceparent`-only propagation helpers (DESIGN.md §11b), thin wrappers
+//!   over fastrace's codec.
+//! - [`extract_headers`] / [`inject_headers`] — full W3C trace-context
+//!   propagation: `traceparent` **and** `tracestate`, via fastrace's
+//!   [`W3CTraceContext`](fastrace::collector::W3CTraceContext). Use at RPC
+//!   boundaries where vendor state must survive propagation.
 //!
 //! With feature `int-futures`, the [`futures`] module re-exports
 //! `fastrace-futures` (`StreamExt::in_span` etc.) for `Stream`/`Sink`
@@ -107,4 +111,25 @@ pub fn extract_traceparent(header: &str) -> Option<SpanContext> {
 #[must_use]
 pub fn inject_traceparent(ctx: &SpanContext) -> String {
     ctx.encode_w3c_traceparent()
+}
+
+/// Decode a W3C trace context from HTTP headers — traceparent AND
+/// tracestate (the full propagation contract, unlike [`extract_traceparent`]
+/// which carries only traceparent). Returns `None` when the set is
+/// malformed or lacks a valid `traceparent`.
+#[must_use]
+pub fn extract_headers(
+    headers: &[(String, String)],
+) -> Option<fastrace::collector::W3CTraceContext> {
+    fastrace::collector::W3CTraceContext::decode_headers(
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    )
+}
+
+/// Render a W3C trace context as HTTP headers — `traceparent` plus
+/// `tracestate` when present (the full round-trip complement of
+/// [`extract_headers`]).
+#[must_use]
+pub fn inject_headers(ctx: &fastrace::collector::W3CTraceContext) -> Vec<(String, String)> {
+    ctx.encode_headers()
 }

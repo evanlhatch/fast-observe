@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Proc macros for fast-observe (instrument/all_functions/skip + error!)"
+repository = "https://github.com/evanlhatch/fast-observe"
+keywords = ["error-handling", "profiling", "macros"]
+categories = ["rust-patterns", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

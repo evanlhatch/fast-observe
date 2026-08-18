@@ -83,21 +83,15 @@ impl std::error::Error for JoinTaskError {}
 /// anything else → `None`, rendered as "unknown panic payload").
 fn panic_payload(e: JoinError) -> Option<String> {
     let payload = e.into_panic();
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        return Some((*s).to_string());
-    }
-    if let Some(s) = payload.downcast_ref::<String>() {
-        return Some(s.clone());
-    }
-    None
+    crate::exn::payload_str(&payload).map(str::to_owned)
 }
 
 /// Extension on the output of `JoinHandle::await`:
 /// `join_handle.await.observe_join("task-name")?`.
 ///
-/// Cancelled and panicked tasks become [`Fault<JoinTaskError>`] with the
-/// distinction carried twice: typed in [`JoinTaskError::kind`] (reachable
-/// via `Fault`'s `Deref`) and as string attachments on the root frame
+/// Cancelled and panicked tasks become [`crate::Fault<JoinTaskError>`] with
+/// the distinction carried twice: typed in [`JoinTaskError::kind`]
+/// (reachable via `Fault`'s `Deref`) and as string attachments on the root frame
 /// (`task: <name>`, `join: cancelled|panic`).
 ///
 /// The error type is [`JoinTaskError`], not the `BoxError` default:

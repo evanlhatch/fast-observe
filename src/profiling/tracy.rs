@@ -32,5 +32,5 @@ pub const fn dummy() -> TracyGuard {
 }
 
 /// Guard — the tracy zone ends on drop (when the inner `Span` is `Some`).
-#[allow(dead_code, reason = "field held only for its Drop side effect")]
+#[expect(dead_code, reason = "field held only for its Drop side effect")]
 pub struct TracyGuard(Option<tracy_client::Span>);

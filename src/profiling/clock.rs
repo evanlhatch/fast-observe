@@ -19,19 +19,48 @@ use web_time::Instant as InstantImpl;
 /// [`now_ns`].
 pub type Instant = InstantImpl;
 
+/// Nanosecond timestamp from the target-selected monotonic clock — carries
+/// the unit in the type so ns/ms mixing is unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Nanos(pub u64);
+
+impl Nanos {
+    /// Read the clock: nanoseconds since an arbitrary process-monotonic origin.
+    #[inline]
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "value is clamped to u64::MAX immediately before the cast"
+    )]
+    pub fn now() -> Nanos {
+        static ORIGIN: OnceLock<InstantImpl> = OnceLock::new();
+        Nanos(
+            ORIGIN
+                .get_or_init(Instant::now)
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        )
+    }
+
+    /// The raw nanosecond count.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// As a [`std::time::Duration`].
+    #[must_use]
+    pub const fn as_duration(self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.0)
+    }
+}
+
 /// Nanoseconds since an arbitrary process-monotonic origin.
 #[inline]
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "value is clamped to u64::MAX immediately before the cast"
-)]
+#[must_use]
 pub fn now_ns() -> u64 {
-    static ORIGIN: OnceLock<InstantImpl> = OnceLock::new();
-    ORIGIN
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_nanos()
-        .min(u128::from(u64::MAX)) as u64
+    Nanos::now().as_u64()
 }
 
 #[cfg(test)]

@@ -1,10 +1,11 @@
 //! `Fault` / `Context` / `bail!` behavior. Display strings here appear in
 //! logs and crash dumps — changing them is a breaking observability change.
-//! (See MIGRATING.md for provenance.)
 // Integration tests are separate crates — the nightly gate must be enabled
 // here, not inherited from the library root (needed by the `error!` macro's
 // generated `Error::provide` overrides).
 #![feature(error_generic_member_access)]
+
+use std::assert_matches;
 
 use core::fmt;
 use std::cell::Cell;
@@ -15,7 +16,7 @@ use fast_observe::exn::{
     Context, Fault, FaultCollection, OptionExt, Placement, Result, ResultExt,
     error_counts_by_category, retry_with_policy,
 };
-use fast_observe::{ErrorCategory, Policy, bail};
+use fast_observe::{ErrorCategory, Policy, bail, ensure};
 
 // ── Context Display stability — these strings appear in logs and crash
 // dumps; changing them is a breaking observability change.
@@ -150,6 +151,33 @@ fn bail_macro_produces_fault_with_message() {
     }
     let err = inner().unwrap_err();
     assert!(err.to_string().contains("bailed 7"));
+}
+
+#[test]
+fn bail_macro_interpolates_format_args() {
+    // anyhow parity: a literal first argument is format!-interpolated.
+    fn inner(x: u32) -> Result<()> {
+        bail!("bailed {x} hard");
+    }
+    let err = inner(7).unwrap_err();
+    assert_eq!(err.to_string(), "bailed 7 hard");
+
+    fn inner_args(x: u32) -> Result<()> {
+        bail!("bailed {} and {}", x, x + 1);
+    }
+    let err = inner_args(7).unwrap_err();
+    assert_eq!(err.to_string(), "bailed 7 and 8");
+}
+
+#[test]
+fn ensure_macro_interpolates_format_args() {
+    fn inner(x: u32) -> Result<()> {
+        ensure!(x > 10, "x={x} too small");
+        Ok(())
+    }
+    let err = inner(3).unwrap_err();
+    assert_eq!(err.to_string(), "x=3 too small");
+    assert!(inner(11).is_ok());
 }
 
 // ── Causal tree structure: nesting + tree rendering ────────────────────
@@ -522,7 +550,7 @@ fn retry_with_policy_no_retry_on_content() {
         uncoded.set(uncoded.get() + 1);
         Err(TestErr)
     });
-    assert!(result.is_err());
+    assert_matches!(result, Err(_));
     assert_eq!(uncoded.get(), 1, "uncoded errors return immediately");
 }
 

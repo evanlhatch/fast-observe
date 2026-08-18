@@ -11,11 +11,15 @@ use ariadne::{Color, FnCache, Label, Report, ReportKind};
 use camino::Utf8PathBuf;
 
 /// Error severity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter, strum::AsRefStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::AsRefStr)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum Severity {
+    /// A hard failure — the primary report kind.
     Error,
+    /// A soft problem — renders with the warning color.
     Warning,
+    /// Advisory output.
     Info,
 }
 
@@ -26,7 +30,9 @@ pub struct SourceSpan {
     /// Path to the source file (`camino` serde support rides on its
     /// `serde1` feature, pulled in by this crate's `serde` feature).
     pub file: Utf8PathBuf,
+    /// Start byte offset, inclusive.
     pub start: usize,
+    /// End byte offset, exclusive.
     pub end: usize,
 }
 
@@ -51,12 +57,16 @@ pub struct Diagnostic {
     /// round-trip through serde — `&'static str` cannot be deserialized from
     /// non-`'static` input.
     pub code: String,
+    /// Error/warning/info — drives the report kind and label colors.
     pub severity: Severity,
+    /// The human-readable error message.
     pub message: String,
     /// Labeled source spans; empty renders a synthetic zero-width
     /// `<unknown>` location.
     #[cfg_attr(feature = "serde", serde(default))]
     pub labels: Vec<LabelSpan>,
+    /// Prescriptive advice — rendered as a report note, and the same slot
+    /// the fault path uses for the registry entry's advice.
     pub advice: Option<String>,
 }
 
@@ -139,6 +149,126 @@ impl fmt::Display for Diagnostic {
 
 impl std::error::Error for Diagnostic {}
 
+/// Anything that can become a [`Diagnostic`] — the bridge between runtime
+/// faults and compile-time-style rendered diagnostics. One renderer (the
+/// ariadne pipeline in `build_report`) serves both worlds: coded runtime
+/// errors render exactly like compile-time diagnostics.
+///
+/// Deliberately NOT sealed — implement it for your own error/report types
+/// to render them through the same pipeline (e.g. a domain type carrying
+/// spans that is not a [`Fault`](crate::exn::Fault)).
+#[diagnostic::on_unimplemented(
+    message = "implement `ToDiagnostic` to render this type as a `Diagnostic`",
+    note = "anyhow/eyre/error-stack boundaries provide conversions via the `compat-*` features"
+)]
+pub trait ToDiagnostic {
+    /// Convert to a renderable diagnostic.
+    fn to_diagnostic(&self) -> Diagnostic;
+}
+
+/// Identity conversion — generic code can accept either a [`Diagnostic`] or
+/// a [`Fault`](crate::exn::Fault) (or any user type) through the same bound.
+impl ToDiagnostic for Diagnostic {
+    fn to_diagnostic(&self) -> Diagnostic {
+        self.clone()
+    }
+}
+
+/// Convert a runtime fault to a diagnostic, reading the ROOT frame only —
+/// the cause chain is not folded in (a `Diagnostic` has one message + one
+/// advice; overloading them with chain frames would garble both).
+///
+/// Mapping:
+/// - code: the [`ErrorCode`](crate::errors::ErrorCode) the root error
+///   provides through `Error::provide` (`error!`-generated types do this
+///   automatically). Uncoded faults have no stable code, so the code slot
+///   carries the error's short type name — see `uncoded_code` for the
+///   heuristic. `Diagnostic.code` is required non-empty and the type name
+///   is the most informative stable label available.
+/// - message: the root error's bare `Display`
+///   ([`Frame::error`](crate::exn::Frame::error)) — NOT the frame's
+///   `Display`, which appends the context in parens.
+/// - advice: the registry entry's advice for the code, else the root
+///   frame's [`Context`](crate::exn::Context) when one is attached.
+/// - severity: [`Severity::Error`]; no labels (faults carry no source
+///   spans — rendering uses the synthetic zero-width `<unknown>` source).
+impl<E: Send + Sync + 'static> ToDiagnostic for crate::exn::Fault<E> {
+    fn to_diagnostic(&self) -> Diagnostic {
+        let frame = self.frame();
+        let provided = core::error::request_value::<crate::errors::ErrorCode>(frame.error());
+        let code = provided.map_or_else(|| uncoded_code(self, frame), |code| code.0.to_string());
+        let advice = provided
+            .and_then(|code| crate::errors::lookup_error(code.0))
+            .and_then(|entry| entry.advice.map(str::to_string))
+            .or_else(|| {
+                let context = frame.context();
+                (!matches!(context, crate::exn::Context::None)).then(|| context.to_string())
+            });
+        let mut diag = Diagnostic::error(&code, frame.error().to_string());
+        diag.advice = advice;
+        diag
+    }
+}
+
+/// Code slot for an uncoded fault: the error's short type name.
+///
+/// Typed faults (`Fault::new(MyError)`) store `type_name::<E>()` on the
+/// root frame — the last `::` segment is the short name. Boxed faults
+/// (`Fault<BoxError>`, e.g. `Fault::from("boom")`) erase the concrete type
+/// at capture: the frame's `type_name` is the `dyn Error + Send + Sync`
+/// trait-object name, and `type_name_of_val` on a `&dyn Error` yields the
+/// same (no vtable-based concrete lookup). The concrete name is recovered
+/// best-effort from the real error's `Debug`, reached through the fault's
+/// typed deref (the root frame's own error is a delegating wrapper whose
+/// `Debug` starts with the WRAPPER name): derived `Debug` output starts
+/// with the type name, so the leading identifier run is the short name
+/// (e.g. `InternalError("boom")` → `InternalError`). When recovery fails
+/// (a hand-written `Debug` not starting with the type name), falls back to
+/// `"Error"`.
+fn uncoded_code<E: Send + Sync + 'static>(
+    fault: &crate::exn::Fault<E>,
+    frame: &crate::exn::Frame,
+) -> String {
+    let type_name = frame.type_name();
+    if !type_name.starts_with("dyn ") {
+        return type_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(type_name)
+            .to_string();
+    }
+    // Boxed fault: deref to the typed error (`E` = `BoxError` here) and
+    // recover the concrete error's name from its `Debug` leading identifier.
+    let typed: &E = fault;
+    if let Some(boxed) = (typed as &dyn std::any::Any).downcast_ref::<crate::BoxError>() {
+        let real: &(dyn std::error::Error + Send + Sync + 'static) = &**boxed;
+        let debug = format!("{real:?}");
+        let ident: String = debug
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !ident.is_empty() {
+            return ident;
+        }
+    }
+    "Error".to_string()
+}
+
+/// Render anything [`ToDiagnostic`] through the ariadne pipeline, returned
+/// as a colorless `String` — the same output [`render_diagnostic`] produces,
+/// for any convertible type.
+#[must_use]
+pub fn render_any(x: &impl ToDiagnostic) -> String {
+    render_diagnostic(&x.to_diagnostic())
+}
+
+/// Render anything [`ToDiagnostic`] through the ariadne pipeline to stderr,
+/// with the same tty/`NO_COLOR`/`TERM` color discipline as
+/// [`eprint_diagnostic`].
+pub fn eprint_any(x: &impl ToDiagnostic) {
+    eprint_diagnostic(&x.to_diagnostic());
+}
+
 /// In-memory sources registered via [`register_source`], consulted before
 /// the filesystem when rendering spans.
 static SOURCES: LazyLock<parking_lot::RwLock<HashMap<String, Arc<str>>>> =
@@ -150,9 +280,22 @@ pub fn register_source(name: impl Into<String>, contents: impl Into<String>) {
     SOURCES.write().insert(name.into(), contents.into().into());
 }
 
-/// color decision: tty && !NO_COLOR && TERM != "dumb"
+/// Look up a registered in-memory source (crate-internal — the report's
+/// source-snippet line consults the same store before the filesystem).
+pub(crate) fn registered_source(name: &str) -> Option<String> {
+    SOURCES.read().get(name).map(ToString::to_string)
+}
+
+/// color decision: `OBSERVE_COLOR=always|never` overrides; `auto` (default)
+/// is tty && !`NO_COLOR` && TERM != "dumb"
 fn should_color(is_tty: bool, no_color_env: Option<&str>, term_env: Option<&str>) -> bool {
-    is_tty && no_color_env.is_none() && term_env != Some("dumb")
+    match crate::config::color_mode() {
+        crate::config::ColorMode::Always => true,
+        crate::config::ColorMode::Never => false,
+        crate::config::ColorMode::Auto => {
+            is_tty && no_color_env.is_none() && term_env != Some("dumb")
+        }
+    }
 }
 
 /// Build the ariadne report for a diagnostic.
@@ -173,16 +316,19 @@ fn build_report(
         Severity::Warning => (ReportKind::Warning, Color::Yellow),
         Severity::Info => (ReportKind::Advice, Color::Cyan),
     };
+    // ariadne asserts `start <= end` on the report anchor and every label;
+    // reversed spans are clamped to (min, max), never panicked on.
+    let clamped = |start: usize, end: usize| start.min(end)..start.max(end);
     // Anchor the report at the first primary label (else the first label,
     // else a synthetic zero-width source).
     let anchor = diag
         .labels
         .iter()
         .find(|l| l.primary)
-        .or(diag.labels.first());
+        .or_else(|| diag.labels.first());
     let (file, range) = anchor.map_or_else(
         || ("<unknown>".to_string(), 0..0),
-        |l| (l.span.file.to_string(), l.span.start..l.span.end),
+        |l| (l.span.file.to_string(), clamped(l.span.start, l.span.end)),
     );
 
     let mut builder = Report::build(kind, (file.clone(), range.clone()))
@@ -204,7 +350,7 @@ fn build_report(
             builder = builder.with_label(
                 Label::new((
                     label.span.file.to_string(),
-                    label.span.start..label.span.end,
+                    clamped(label.span.start, label.span.end),
                 ))
                 .with_message(message)
                 .with_color(if label.primary {
@@ -237,7 +383,7 @@ fn build_report(
 pub fn render_diagnostic(diag: &Diagnostic) -> String {
     let mut buf = Vec::new();
     if let Err(e) = build_report(diag, false).write(source_cache(), &mut buf) {
-        log::error!(target: "fast_observe.diagnostic", "failed to render diagnostic: {e}");
+        log::error!(target: crate::log_targets::DIAGNOSTIC, "failed to render diagnostic: {e}");
         return format!("[{}] {}", diag.code, diag.message);
     }
     String::from_utf8_lossy(&buf).into_owned()
@@ -253,7 +399,7 @@ pub fn eprint_diagnostic(diag: &Diagnostic) {
         std::env::var("TERM").ok().as_deref(),
     );
     if let Err(e) = build_report(diag, color).eprint(source_cache()) {
-        log::error!(target: "fast_observe.diagnostic", "failed to render diagnostic: {e}");
+        log::error!(target: crate::log_targets::DIAGNOSTIC, "failed to render diagnostic: {e}");
     }
 }
 

@@ -33,6 +33,10 @@ pub struct CategoryTag(pub ErrorCategory);
 /// it for error types defined without the [`error!`](crate::error) macro
 /// (implement manually only if not using `error!`, which generates this impl
 /// plus registry entries for you).
+#[diagnostic::on_unimplemented(
+    message = "error types must implement `Coded` — define the type with `error!` to get it automatically",
+    note = "`error!` generates the entry, code, and category accessors"
+)]
 pub trait Coded {
     /// Stable registry code, e.g. `"E100"`.
     fn code(&self) -> &'static str;
@@ -58,6 +62,9 @@ pub struct ErrorRegistryEntry {
     /// Prescriptive advice — populated by `error!` from `#[advice = "..."]`
     /// or the variant's first doc-comment line.
     pub advice: Option<&'static str>,
+    /// Variant-specific action text (from `#[action = "..."]`) — overrides
+    /// the generic category-policy line in the report's `action:` section.
+    pub action: Option<&'static str>,
     /// Defining module path (`module_path!()` at the `error!` call site).
     pub module: &'static str,
 }
@@ -135,12 +142,39 @@ pub fn lookup_error(code: &str) -> Option<&'static ErrorRegistryEntry> {
     error_registry().find(|e| e.code == code)
 }
 
+/// Registry entries whose code starts with `query` (case-sensitive),
+/// sorted by code. Pure lookup helper behind [`doctor`]'s prefix fallback.
+fn similar_codes(query: &str) -> Vec<&'static ErrorRegistryEntry> {
+    let mut matches: Vec<&'static ErrorRegistryEntry> = error_registry()
+        .filter(|entry| entry.code.starts_with(query))
+        .collect();
+    matches.sort_by(|a, b| a.code.cmp(b.code));
+    matches
+}
+
 /// Render a doctor report for an error code: code, name, category, policy
 /// advice line, canonical display, advice, defining module. Deterministic
 /// `key: value` lines, one fact per line.
+///
+/// On an exact miss, falls back to a case-sensitive prefix search: when any
+/// registered code starts with `code`, returns a report whose first line is
+/// `no exact match for {code:?} — similar codes:` followed by one
+/// `code: name (category)` line per match, sorted by code. Returns `None`
+/// only when neither exact nor prefix matches exist.
 #[must_use]
 pub fn doctor(code: &str) -> Option<String> {
-    let entry = lookup_error(code)?;
+    let Some(entry) = lookup_error(code) else {
+        let similar = similar_codes(code);
+        if similar.is_empty() {
+            return None;
+        }
+        let mut out = format!("no exact match for {code:?} — similar codes:");
+        for entry in similar {
+            // Infallible on String.
+            let _ = write!(out, "\n{}: {} ({})", entry.code, entry.name, entry.category);
+        }
+        return Some(out);
+    };
     let mut out = format!(
         "code: {}\nname: {}\ncategory: {}\npolicy: {}\ndisplay: {}",
         entry.code,
@@ -153,7 +187,70 @@ pub fn doctor(code: &str) -> Option<String> {
         // Infallible on String.
         let _ = write!(out, "\nadvice: {advice}");
     }
+    if let Some(action) = entry.action {
+        // Infallible on String.
+        let _ = write!(out, "\naction: {action}");
+    }
     // Infallible on String.
     let _ = write!(out, "\nmodule: {}", entry.module);
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The registry is populated by `error!` macro invocations at link time;
+    // these tests make no assumption about its contents.
+
+    #[test]
+    fn similar_codes_matches_manual_filter_and_is_sorted() {
+        for query in ["E", "E1", "zz-no-such-prefix"] {
+            let expected: Vec<&'static str> = error_registry()
+                .filter(|entry| entry.code.starts_with(query))
+                .map(|entry| entry.code)
+                .collect();
+            let actual: Vec<&'static str> = similar_codes(query)
+                .iter()
+                .map(|entry| entry.code)
+                .collect();
+            assert!(actual.windows(2).all(|w| w[0] <= w[1]));
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn doctor_unknown_code_with_no_prefix_match_is_none() {
+        // No registered code starts with a NUL byte.
+        assert!(similar_codes("\0not-a-code").is_empty());
+        assert!(doctor("\0not-a-code").is_none());
+    }
+
+    #[test]
+    fn doctor_prefix_miss_lists_similar_codes_sorted() {
+        let query = "E";
+        if lookup_error(query).is_some() {
+            // Exact hit — the prefix path is not exercised by this registry.
+            return;
+        }
+        let similar = similar_codes(query);
+        match doctor(query) {
+            None => assert!(similar.is_empty()),
+            Some(report) => {
+                assert_eq!(
+                    report.lines().next(),
+                    Some("no exact match for \"E\" — similar codes:"),
+                    "report:\n{report}"
+                );
+                let lines: Vec<&str> = report.lines().skip(1).collect();
+                assert_eq!(lines.len(), similar.len(), "report:\n{report}");
+                for (line, entry) in lines.iter().zip(&similar) {
+                    assert_eq!(
+                        *line,
+                        format!("{}: {} ({})", entry.code, entry.name, entry.category)
+                    );
+                }
+            }
+        }
+    }
 }

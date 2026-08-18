@@ -1,5 +1,5 @@
-error: `#[code]` requires `category = <Content|Invariant|Transient|Fatal>`
-  --> tests/ui/code_without_category.rs:12:18
+error: `#[code]` requires `category = <Content|Invariant|Transient|Fatal>` (or an enum-level `#[category]` default)
+  --> tests/ui/code_without_category.rs:13:9
    |
-12 |         #[code = "E901"]
-   |                  ^^^^^^
+13 |         CodeAlone,
+   |         ^^^^^^^^^

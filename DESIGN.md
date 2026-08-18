@@ -1,8 +1,11 @@
-# fast-observe — overhaul design
+# fast-observe — design
 
-Goal: the definitive Rust observability crate. One dependency that deploys
-fastrace + logforth + a multi-profiler facade, fused with an exn-grade typed
-error tree, producing causal, prescriptive, LLM-agent-readable output.
+> Design rationale and invariants. The implemented user surface is documented in rustdoc and OBSERVE.md; where this doc and the code disagree, the code wins.
+
+Goal: one crate that deploys errors-with-causal-trees, profiling, logs, and
+traces sharing identifiers — fastrace + logforth + a multi-profiler facade
+fused with an exn-grade typed error tree, producing causal, prescriptive,
+LLM-agent-readable output.
 
 Non-goals: reimplementing profiling backends, replacing tracing, being a
 metrics system.
@@ -43,8 +46,8 @@ layer 2: deploy    init()/builder wiring logforth + fastrace + Tier-2 profilers
 Rule: **lower layers never name logforth/fastrace types**. Layer 0 must work
 pre-`init()`, post-`init()`, in tests, in wasm, with hooks cleared. The error
 path never breaks because a sink is missing. This is already mostly true
-(hook.rs is the only place logforth/fastrace are named); the builder work
-must not regress it.
+(hook.rs is the only place logforth/fastrace are named); the Deployment
+builder does not regress it.
 
 Single crate, feature-gated. Not a workspace: the layers are small, and
 feature flags give identical pay-for-what-you-use granularity without
@@ -133,13 +136,13 @@ config().set_backends(Backends::FASTRACE | Backends::TRACY);
   compile C/C++, otel pulls the OTel SDK tree — none of it exists in the
   build unless its feature is named.
 
-Also re-export from `profiling-procmacros`: `function` (currently missing —
-only `all_functions`/`skip` are re-exported).
+Attribute-macro re-export: superseded by §9c-ext — the macros are owned by
+fast-observe-macros, not re-exported from `profiling-procmacros`.
 
-### Async gap (must close for "ultimate")
+### Async gap
 
 `scope!` guards are thread-bound (`!Send`); instrumenting across `.await`
-is wrong today. With feature `int-futures` (fastrace-futures), add:
+needs a dedicated surface. With feature `int-futures` (fastrace-futures):
 
 ```rust
 future.in_observed_span("load")   // wraps fastrace's in_span + scope-name TLS
@@ -202,8 +205,8 @@ one table in README.
 
 ### Hooks
 
-`add_error_hook` stays; add `clear_error_hooks()`, `hooks_len()` (tests),
-`set_default_hook_enabled(bool)`. Hook list clone-per-error is fine (cold
+`add_error_hook` stays; `clear_error_hooks()`, `hooks_len()` (tests), and
+`set_default_hook_enabled(bool)` round out hook management. Hook list clone-per-error is fine (cold
 path); if a profile ever says otherwise, swap `Mutex<Vec<Hook>>` for
 `arc_swap::ArcSwap<Vec<Hook>>` — internal change, no API impact.
 
@@ -349,7 +352,7 @@ for attempt in 1..=3 {
 Err(errs.into_fault(JournalError::Flaky))   // one Fault, three children
 ```
 
-flatland's `Desync`/retry paths and batch compaction are the consumers.
+Retry/recovery loops and batch-compaction paths are the consumers.
 
 ### 5.9 Compat matrix (rootcause's full set, same pattern per crate)
 
@@ -446,8 +449,8 @@ let _guard = fast_observe::builder().logs(|l| l.env_filter().stdout()).init()?;
 work().await.change_context(Boot).report_or_die();
 ```
 
-(Also add `report_or_die`/`Fatal` handling? Deferred — decide after the
-report module lands; keep the swallow/blessed-`report` story unchanged.)
+(Also add `report_or_die`/`Fatal` handling? Open — see §11; the
+swallow/blessed-`report` story is unchanged.)
 
 ---
 
@@ -471,7 +474,7 @@ report module lands; keep the swallow/blessed-`report` story unchanged.)
 
 ---
 
-## 9a. rootcause review — adopted vs rejected (evidence: ~/rootcause @0.14)
+## 9a. rootcause review — adopted vs rejected (evidence: rootcause @0.14)
 
 Adopted (adapted to our leaner model): capture-hook family (5.6), typed
 attachments w/ placement (5.7), pluggable report formatter (5.6),
@@ -490,7 +493,7 @@ Rejected, with reasons:
   shared Arc — fix by documenting + making attachment APIs take `&mut`
   during construction only, which capture hooks now own.)
 - **`Local` (!Send/!Sync) reports.** Every global registry we have
-  (counts, throttle, hooks, trace-id) assumes Send+Sync; flatland has no
+  (counts, throttle, hooks, trace-id) assumes Send+Sync; no consumer has an
   Rc-error need. Skipping halves the marker matrix.
 - **no_std.** parking_lot, TLS, logforth, fastrace are all std. Not a
   goal.
@@ -504,14 +507,14 @@ Rejected, with reasons:
 - **Splitting into 4 crates** (internals/backtrace/tracing/preformat).
   Features give us the same modularity in one crate.
 
-What their existence proves for our roadmap: creation hooks carrying
+What their existence proves for this design: creation hooks carrying
 backtrace+span capture as OPTIONAL sub-crates validates making our
 capture hooks the extension point (5.6); their compat modules validate
 the explicit-boundary philosophy (never implicit From).
 
 ## 9b. Ecosystem scan — further adoptions (source crate cited per idea)
 
-### Features to add
+### Features
 
 1. **Scope STACK, not slot** (tracing-error's `SpanTrace`). `CURRENT_SCOPE`
    is one `(name, Instant)`; nested `scope!`/`profiling!` overwrite it.
@@ -526,7 +529,7 @@ the explicit-boundary philosophy (never implicit From).
    error report then carries "what was happening just before it broke"
    without any extra instrumentation. Gate: instant backend active.
 3. **Panic unification** (color-eyre / human-panic).
-   `observe().panic_hook(true)` (default on for presets): panics render
+   `observe().panic_hook(true)` (default on): panics render
    through the SAME report pipeline — category Fatal, location from
    PanicHookInfo, backtrace per capture config, scope path, trace_id,
    then chain to the previously installed hook (composability — never
@@ -718,7 +721,7 @@ Verified live bug first: `profiling-procmacros` expands to
 `profiling::function_scope!()` / `profiling::tracing::span!(...)` — paths
 into the `profiling` crate we do NOT depend on. Our re-exported
 `all_functions`/`skip` are UNCOMPILABLE for consumers without a separate
-`profiling` dep. Fix lands in stage 5: own macros in fast-observe-macros
+`profiling` dep. Fix: own macros in fast-observe-macros
 (expand to `$crate` paths, push our scope stack, delegate to
 `#[fastrace::trace]` when enabled — async-correct via `enter_on_poll`).
 
@@ -731,10 +734,9 @@ Extension-point adoptions (no forks; all public APIs):
   test span assertions; builder takes `collector::Config`.
 - logforth: `core::builder()` multi-dispatch for Deployment (starter_log
   stays for init()); `Append/Layout/Filter/Diagnostic` as typed escape
-  hatches; `append::Testing` for tests. **log `kv` feature is already
-  enabled but unused** — default hook logs `error.code`/`error.category`/
-  `error.location`/`trace.id` as structured kv so JsonLayout/OTel emit
-  fields, not strings.
+  hatches; `append::Testing` for tests. **log `kv` feature**: the default
+  hook logs `error.code`/`error.category`/`error.location`/`trace.id` as
+  structured kv so JsonLayout/OTel emit fields, not strings.
 - exn convergence: `impl Error for Frame` with `source()` → first child;
   `Fault::source` likewise — the causal tree becomes traversable by
   std-protocol tooling (anyhow chain walker, sources(), error-stack).
@@ -786,6 +788,9 @@ in sanely:
    `ItemsCount` ("errors/sec" on error-path benches).
 
 ## 10. Migration + rollout (jj stages, each independently green)
+
+All stages below have landed; the list is kept as the historical record of
+the change order.
 
 1. `fix`: tree-prefix connectors, `wrap_msg` source walk, scope stack
    (9b.1), single `Frame::capture` constructor, hook-test race (9c.1),
@@ -847,7 +852,7 @@ linkme still wins for us because:
   wasm (our §11a.2 fallback needs no ctor machinery at all).
 - **Explicit registration** (`register_errors::<MyError>()` at startup)
   kills the entire value proposition: zero-coordination cross-crate
-  aggregation. The magic is that flatland-journal's errors appear in the
+  aggregation. The value is that a downstream crate's errors appear in the
   binary's doctor output without any crate knowing the others exist. Any
   explicit scheme reintroduces the registration call everyone forgets.
 - **Per-crate statics + hand-listing** — same forgetfulness problem.
@@ -888,8 +893,8 @@ cover both, but the differences matter:
 - unknown-unknown: web-time via performance.now; no std env/fs; `web`
   feature's console appender; browser-only.
 
-Consumers may use linkme freely if they already have it (flatland does —
-fine), but fast-observe never REQUIRES it: `error!` registrations route
+Consumers may use linkme freely if they already have it, but fast-observe
+never REQUIRES it: `error!` registrations route
 through `__private` via `#[linkme(crate = ...)]` (shipped).
 
 ### Original audit (target: wasm32-unknown-unknown) — still applies, with the wasip3 deltas above
@@ -1076,7 +1081,7 @@ replicating.
   add a `just miri` recipe running the hook/TLS/instant-stack tests under
   miri — dev-mode UB detection across the dep tree.
 
-Toolchain pinning: rolling nightly via devenv (same as flatland). Do NOT
+Toolchain pinning: rolling nightly via devenv. Do NOT
 add rust-toolchain.toml — it fights the devenv-provided toolchain;
 revisit only if non-devenv contributors appear.
 
@@ -1099,4 +1104,4 @@ revisit only if non-devenv contributors appear.
   (pluggable custom runtime backends). Lean: closed enum + Tier-2 covers it.
 - `report_or_die`/process-exit helpers: wait for user demand.
 - Whether `define_errors!` grows `#[advice = "..."]` per variant feeding
-  both Diagnostic notes and the report action line. Lean: yes, stage 5/6.
+  both Diagnostic notes and the report action line. Lean: yes.

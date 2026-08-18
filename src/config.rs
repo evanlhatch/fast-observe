@@ -43,26 +43,39 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 pub struct Backends(u16);
 
 impl Backends {
+    /// Profiling disabled — `scope!` is a ~2ns no-op.
     pub const OFF: Self = Self(0);
+    /// Thread-local span accumulator — deterministic per-phase breakdown.
     pub const INSTANT: Self = Self(1 << 0);
+    /// fastrace `LocalSpan`s — the default.
     pub const FASTRACE: Self = Self(1 << 1);
     /// Instant spans + browser-console logging (feature `web`, wasm32).
     pub const WEB: Self = Self(1 << 2);
+    /// puffin profiler (feature `profile-with-puffin`).
     pub const PUFFIN: Self = Self(1 << 3);
+    /// Tracy profiler (feature `profile-with-tracy`).
     pub const TRACY: Self = Self(1 << 4);
+    /// Superluminal profiler (feature `profile-with-superluminal`, windows).
+    /// NOTE: bit 5 (`1 << 5`) is intentionally reserved/unused — do not
+    /// assign it without checking persisted masks elsewhere.
     pub const SUPERLUMINAL: Self = Self(1 << 6);
+    /// `tracing` span backend (feature `profile-with-tracing`).
     pub const TRACING: Self = Self(1 << 7);
 
+    /// An empty backend set — `OFF` under a different name, for callers
+    /// that prefer the set-semantics vocabulary over the power-off one.
     #[must_use]
     pub const fn empty() -> Self {
         Self::OFF
     }
 
+    /// `true` when every bit of `other` is set in this mask.
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// `true` for the empty set (see [`Backends::empty`]).
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -75,29 +88,89 @@ impl Backends {
     #[must_use]
     pub fn from_env_value(s: &str) -> Option<Self> {
         let mut out = Self::OFF;
-        let mut tokens = 0_u32;
         let mut saw_off = false;
+        let mut saw_other = false;
         for part in s.split(',') {
-            tokens += 1;
-            match part.trim().to_ascii_lowercase().as_str() {
-                "off" => saw_off = true,
-                "instant" => out |= Self::INSTANT,
-                "fastrace" => out |= Self::FASTRACE,
-                "web" => out |= Self::WEB,
-                "puffin" => out |= Self::PUFFIN,
-                "tracy" => out |= Self::TRACY,
-                "superluminal" => out |= Self::SUPERLUMINAL,
-                "tracing" => out |= Self::TRACING,
-                _ => return None,
+            let name = part.trim().to_ascii_lowercase();
+            if name == "off" {
+                saw_off = true;
+                continue;
             }
+            let info = BACKENDS_INFO.iter().find(|info| info.name == name)?;
+            out |= info.bit;
+            saw_other = true;
         }
         // `off` alone → OFF; combined with anything else it is ambiguous.
-        if saw_off && tokens > 1 {
+        if saw_off && saw_other {
             return None;
         }
         Some(out)
     }
 }
+
+/// One row per selectable backend: mask bit, env/config name, cargo feature,
+/// compiled-in availability.
+pub(crate) struct BackendInfo {
+    /// The mask bit this row describes.
+    pub bit: Backends,
+    /// The env/config name matched by [`Backends::from_env_value`].
+    pub name: &'static str,
+    /// The cargo feature that compiles this backend in.
+    pub feature: &'static str,
+    /// `true` when the backend's cargo feature (and target constraint, if
+    /// any) is compiled in for this build.
+    pub available: bool,
+}
+
+/// Every selectable backend. `WEB`'s availability is the instant feature's
+/// (spans ride on the instant backend; the console half is a log appender).
+pub(crate) const BACKENDS_INFO: &[BackendInfo] = &[
+    BackendInfo {
+        bit: Backends::INSTANT,
+        name: "instant",
+        feature: "instant",
+        available: crate::profiling::instant_wrap::AVAILABLE,
+    },
+    BackendInfo {
+        bit: Backends::FASTRACE,
+        name: "fastrace",
+        feature: "fastrace",
+        available: crate::profiling::fastrace_wrap::AVAILABLE,
+    },
+    BackendInfo {
+        // Deliberate: `WEB` spans ride on the instant backend (the
+        // browser-console half is a log appender), so its availability is
+        // the instant feature, not `web`.
+        bit: Backends::WEB,
+        name: "web",
+        feature: "web",
+        available: crate::profiling::instant_wrap::AVAILABLE,
+    },
+    BackendInfo {
+        bit: Backends::PUFFIN,
+        name: "puffin",
+        feature: "profile-with-puffin",
+        available: crate::profiling::puffin_wrap::AVAILABLE,
+    },
+    BackendInfo {
+        bit: Backends::TRACY,
+        name: "tracy",
+        feature: "profile-with-tracy",
+        available: crate::profiling::tracy_wrap::AVAILABLE,
+    },
+    BackendInfo {
+        bit: Backends::SUPERLUMINAL,
+        name: "superluminal",
+        feature: "profile-with-superluminal",
+        available: crate::profiling::superluminal_wrap::AVAILABLE,
+    },
+    BackendInfo {
+        bit: Backends::TRACING,
+        name: "tracing",
+        feature: "profile-with-tracing",
+        available: crate::profiling::tracing_wrap::AVAILABLE,
+    },
+];
 
 // NOTE: plain (non-const) trait impls — `impl const` would need the nightly
 // `const_trait_impl` feature enabled at the crate root, which this crate
@@ -123,6 +196,8 @@ pub struct ObserveConfig {
 }
 
 impl ObserveConfig {
+    /// Start in the default state: fastrace backends, unlimited error-hook
+    /// throttle. Use [`config()`] to get the process-global instance.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -160,60 +235,16 @@ impl ObserveConfig {
     fn warn_unavailable(requested: Backends) {
         /// Backend bits already warned about (warn once per process).
         static WARNED: AtomicU16 = AtomicU16::new(0);
-        // `WEB` spans ride on the instant backend (the browser-console half is
-        // a log appender), so its availability is the instant feature.
-        let table = [
-            (
-                Backends::INSTANT,
-                "instant",
-                "instant",
-                crate::profiling::instant_wrap::AVAILABLE,
-            ),
-            (
-                Backends::FASTRACE,
-                "fastrace",
-                "fastrace",
-                crate::profiling::fastrace_wrap::AVAILABLE,
-            ),
-            (
-                Backends::WEB,
-                "web",
-                "web",
-                crate::profiling::instant_wrap::AVAILABLE,
-            ),
-            (
-                Backends::PUFFIN,
-                "puffin",
-                "profile-with-puffin",
-                crate::profiling::puffin_wrap::AVAILABLE,
-            ),
-            (
-                Backends::TRACY,
-                "tracy",
-                "profile-with-tracy",
-                crate::profiling::tracy_wrap::AVAILABLE,
-            ),
-            (
-                Backends::SUPERLUMINAL,
-                "superluminal",
-                "profile-with-superluminal",
-                crate::profiling::superluminal_wrap::AVAILABLE,
-            ),
-            (
-                Backends::TRACING,
-                "tracing",
-                "profile-with-tracing",
-                crate::profiling::tracing_wrap::AVAILABLE,
-            ),
-        ];
-        for (bit, name, feature, available) in table {
-            if available || !requested.contains(bit) {
+        for info in BACKENDS_INFO {
+            if info.available || !requested.contains(info.bit) {
                 continue;
             }
-            if WARNED.fetch_or(bit.0, Ordering::AcqRel) & bit.0 == 0 {
+            if WARNED.fetch_or(info.bit.0, Ordering::AcqRel) & info.bit.0 == 0 {
                 log::warn!(
-                    target: "fast_observe.config",
-                    "profiling backend '{name}' requested but not compiled in — enable cargo feature `{feature}`"
+                    target: crate::log_targets::CONFIG,
+                    "profiling backend '{}' requested but not compiled in — enable cargo feature `{}`",
+                    info.name,
+                    info.feature
                 );
             }
         }
@@ -242,21 +273,21 @@ impl Default for ObserveConfig {
 
 static CONFIG: LazyLock<ObserveConfig> = LazyLock::new(|| {
     let cfg = ObserveConfig::new();
-    if let Ok(value) = std::env::var("OBSERVE_PROFILE") {
+    if let Ok(value) = std::env::var(crate::env_vars::OBSERVE_PROFILE) {
         match Backends::from_env_value(&value) {
             Some(backends) => cfg.set_backends(backends),
             None => log::warn!(
-                target: "fast_observe.config",
+                target: crate::log_targets::CONFIG,
                 "invalid OBSERVE_PROFILE={value:?}; expected comma-separated \
                  off|instant|fastrace|web|puffin|tracy|superluminal|tracing — keeping default"
             ),
         }
     }
-    if let Ok(value) = std::env::var("OBSERVE_ERROR_THROTTLE") {
+    if let Ok(value) = std::env::var(crate::env_vars::OBSERVE_ERROR_THROTTLE) {
         match value.trim().parse::<u32>() {
             Ok(n) => cfg.set_error_hook_throttle(n),
             Err(_) => log::warn!(
-                target: "fast_observe.config",
+                target: crate::log_targets::CONFIG,
                 "invalid OBSERVE_ERROR_THROTTLE={value:?}; expected a u32 — keeping default (0 = unlimited)"
             ),
         }
@@ -269,6 +300,117 @@ static CONFIG: LazyLock<ObserveConfig> = LazyLock::new(|| {
 #[must_use]
 pub fn config() -> &'static ObserveConfig {
     &CONFIG
+}
+
+/// Parse a case-insensitive env enum: read `var`, trim + lowercase it, run
+/// `parse` on the normalized value. On an unparseable value, warns on target
+/// `fast_observe.config` and returns `default`. A missing var returns
+/// `default` silently. Shared by every `OBSERVE_*` `LazyLock` (single
+/// parse-once discipline — DESIGN.md §9c-ext).
+pub(crate) fn env_enum<T: Copy>(
+    var: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    default: T,
+    expected: &str,
+) -> T {
+    let Ok(value) = std::env::var(var) else {
+        return default;
+    };
+    if let Some(parsed) = parse(value.trim().to_ascii_lowercase().as_str()) {
+        return parsed;
+    }
+    log::warn!(
+        target: crate::log_targets::CONFIG,
+        "invalid {var}={value:?}; expected {expected} — keeping default"
+    );
+    default
+}
+
+// ── Report mode — OBSERVE_REPORT (DESIGN.md §7) ───────────────────────────
+
+/// How the default error hook renders errors (`OBSERVE_REPORT`).
+/// `Off` keeps the classic one-line `log::error!`; `Text`/`Json` emit the
+/// full report block as one structured event instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ReportMode {
+    #[default]
+    /// Classic one-line hook log.
+    Off,
+    /// The full text report block (`report::render_frame_report`).
+    Text,
+    /// The versioned JSON report (feature `serde`). Falls back to `Text`
+    /// without the feature.
+    Json,
+}
+
+/// The default-hook report mode, resolved ONCE from `OBSERVE_REPORT`
+/// (`off|text|json`, case-insensitive; anything else → `Off` + a warning).
+static REPORT_MODE: LazyLock<ReportMode> = LazyLock::new(|| {
+    env_enum(
+        crate::env_vars::OBSERVE_REPORT,
+        |name| match name {
+            "off" | "" => Some(ReportMode::Off),
+            "text" | "1" | "true" => Some(ReportMode::Text),
+            "json" => {
+                if cfg!(not(feature = "serde")) {
+                    log::warn!(
+                        target: crate::log_targets::CONFIG,
+                        "OBSERVE_REPORT=json requested but cargo feature `serde` is not compiled in — falling back to text"
+                    );
+                    Some(ReportMode::Text)
+                } else {
+                    Some(ReportMode::Json)
+                }
+            }
+            _ => None,
+        },
+        ReportMode::Off,
+        "off|text|json",
+    )
+});
+
+/// The default-hook report mode (see [`ReportMode`]).
+#[must_use]
+pub fn report_mode() -> ReportMode {
+    *REPORT_MODE
+}
+
+// ── Color mode — OBSERVE_COLOR (DESIGN.md §3) ─────────────────────────────
+
+/// Color decision for rendered output (`OBSERVE_COLOR`). `Auto` keeps the
+/// tty + `NO_COLOR` + `TERM=dumb` discipline; `Always`/`Never` override it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ColorMode {
+    #[default]
+    /// tty && !`NO_COLOR` && TERM != "dumb".
+    Auto,
+    /// Force color even off-tty.
+    Always,
+    /// Force no color even on-tty.
+    Never,
+}
+
+/// The color mode, resolved ONCE from `OBSERVE_COLOR`
+/// (`auto|always|never`, case-insensitive; anything else → `Auto`).
+static COLOR_MODE: LazyLock<ColorMode> = LazyLock::new(|| {
+    env_enum(
+        crate::env_vars::OBSERVE_COLOR,
+        |name| match name {
+            "always" | "1" | "true" => Some(ColorMode::Always),
+            "never" | "0" | "false" => Some(ColorMode::Never),
+            _ => None,
+        },
+        ColorMode::Auto,
+        "auto|always|never",
+    )
+});
+
+/// The color mode (see [`ColorMode`]).
+#[must_use]
+pub fn color_mode() -> ColorMode {
+    *COLOR_MODE
 }
 
 #[cfg(test)]

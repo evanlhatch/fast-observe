@@ -15,6 +15,7 @@ use sealed::sealed;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 
 // ── Error counter — every constructed error frame, keyed by type ───────────
@@ -22,13 +23,24 @@ use std::sync::{Arc, LazyLock};
 static ERROR_COUNTS: LazyLock<Mutex<HashMap<&'static str, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Counter key for errors deliberately swallowed via [`ResultExt::report`] —
+/// lives in the same namespace as type names but is a bare word, so it can
+/// never collide with a `module::path::Type` key.
+pub(crate) const REPORTED_KEY: &str = "reported";
+
 /// Increment the counter for an error frame's type. Cold path — mutex is fine.
 #[cold]
 pub(crate) fn record_error(type_name: &'static str) {
     *ERROR_COUNTS.lock().entry(type_name).or_insert(0) += 1;
-    // Feature `metrics-facade`: mirror the counter through the `metrics`
-    // facade so exporters (Prometheus, OTel, …) see error construction too.
-    #[cfg(feature = "metrics-facade")]
+}
+
+/// Feature `metrics-facade`: mirror the error-construction counter through
+/// the `metrics` facade so exporters (Prometheus, `OTel`, …) see it too.
+/// Called AFTER the counts lock is released — a slow exporter must never
+/// stall the error hot path.
+#[cfg(feature = "metrics-facade")]
+#[cold]
+pub(crate) fn record_error_metrics(type_name: &'static str) {
     metrics::counter!("fast_observe.errors", "type" => type_name).increment(1);
 }
 
@@ -86,13 +98,7 @@ fn category_for_type_name(type_name: &str) -> Option<crate::ErrorCategory> {
 
 /// Sort key for the category bucket: uncategorized (`None`) sorts first.
 fn category_key(category: Option<crate::ErrorCategory>) -> &'static str {
-    match category {
-        None => "",
-        Some(crate::ErrorCategory::Content) => "Content",
-        Some(crate::ErrorCategory::Invariant) => "Invariant",
-        Some(crate::ErrorCategory::Transient) => "Transient",
-        Some(crate::ErrorCategory::Fatal) => "Fatal",
-    }
+    category.map_or("", Into::into)
 }
 
 /// A boxed error — the default `E` for `Fault` / `Result`.
@@ -101,16 +107,7 @@ pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 // ── Context — generic, reusable error context ──────────────────────────────
 
 /// Typed context attached to an error frame.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Default,
-    derive_more::Display,
-    documented::DocumentedVariants,
-    strum::EnumIter,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, derive_more::Display)]
 #[non_exhaustive]
 pub enum Context {
     /// No context attached (default).
@@ -131,22 +128,52 @@ pub enum Context {
 }
 
 impl Context {
+    /// Named-scope context — a function, module, operation, or phase name
+    /// (the [`Context::Scope`] variant).
     #[must_use]
     pub fn scope(name: impl Into<Cow<'static, str>>) -> Self {
         Self::Scope(name.into())
     }
+    /// Numeric tick/iteration context (the [`Context::Tick`] variant).
     #[must_use]
     pub const fn tick(s: u64) -> Self {
         Self::Tick(s)
     }
+    /// Named-entity + tick context — e.g. object name + iteration (the
+    /// [`Context::Entity`] variant).
     #[must_use]
     pub fn entity(name: impl Into<Cow<'static, str>>, tick: u64) -> Self {
         Self::Entity(name.into(), tick)
     }
+    /// Free-form context for application-specific use (the
+    /// [`Context::Custom`] variant).
     #[must_use]
     pub fn custom(msg: impl Into<Cow<'static, str>>) -> Self {
         Self::Custom(msg.into())
     }
+}
+
+// ── FrameKind — the causal relationship on a parent→child edge ─────────────
+
+/// Why a frame sits under its parent. Stored on the EDGE (alongside each
+/// child in [`Frame::child_edges`]), not on the frame itself: a frame's
+/// meaning is fixed, but the same shared frame could be referenced under
+/// different relationships.
+///
+/// The report renders these as distinct labels (`cause` / `original` /
+/// `attempt` / `failure`) so a reader can tell "the underlying OS error"
+/// from "retry attempt 2".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr)]
+#[strum(serialize_all = "lowercase")]
+pub enum FrameKind {
+    /// A cause from the parent's `Error::source()` chain (stringified).
+    Source,
+    /// The original error a `wrap`/`context` overlay was raised over.
+    Wrap,
+    /// A failed attempt collected by [`retry_with_backoff`].
+    Attempt,
+    /// A failure merged in by [`FaultCollection`].
+    Batch,
 }
 
 // ── Attachments — typed, inspectable data on frames ───────────────────────
@@ -163,6 +190,39 @@ pub enum Placement {
     Opaque,
     /// Not shown, not counted. Programmatic only.
     Hidden,
+}
+
+/// Built-in attachment keys — the single source of truth linking the
+/// capture hooks in [`crate::hook`] (producers) to [`crate::report`]
+/// (consumer). A typo in a bare `"scope_path"` literal on either side would
+/// compile and silently drop a report section; the enum makes the linkage
+/// compile-time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinKey {
+    /// Profiling scope path (`outer → … → leaf`) at fault time.
+    ScopePath,
+    /// Leaf scope's elapsed milliseconds at fault time.
+    ScopeElapsedMs,
+    /// Current fastrace trace id (feature `fastrace`).
+    TraceId,
+    /// Recent finished-span trail breadcrumb (feature `instant`).
+    SpanTrail,
+    /// Captured backtrace (feature `backtrace`, env-gated).
+    Backtrace,
+}
+
+impl BuiltinKey {
+    /// The wire key used in [`Attachment::key`] and report rendering.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScopePath => "scope_path",
+            Self::ScopeElapsedMs => "scope_elapsed_ms",
+            Self::TraceId => "trace_id",
+            Self::SpanTrail => "span_trail",
+            Self::Backtrace => "backtrace",
+        }
+    }
 }
 
 /// A typed attachment on a [`Frame`]: cached display string + typed value
@@ -192,13 +252,20 @@ impl Attachment {
     }
     /// An attachment with a key — rendered `key: value`,
     /// [`Placement::Inline`].
+    ///
+    /// Keys must be non-empty and free of `\n`, `\r`, `=` — the report
+    /// renders `attachment: key=value`, one fact per line, so those bytes
+    /// are protocol-breaking (debug builds assert; release builds render
+    /// the key as-is).
     #[must_use]
     pub fn with_key(key: &'static str, value: impl fmt::Display + Send + Sync + 'static) -> Self {
+        debug_assert!(
+            !key.is_empty() && !key.contains(['\n', '\r', '=']),
+            "attachment key {key:?} breaks the report's one-fact-per-line contract"
+        );
         Self {
             key: Some(key),
-            display: value.to_string(),
-            value: Arc::new(value),
-            placement: Placement::Inline,
+            ..Self::new(value)
         }
     }
     /// Builder-style [`Placement`] override.
@@ -262,12 +329,33 @@ pub struct Frame {
     pub(crate) error: BoxError,
     pub(crate) location: &'static Location<'static>,
     pub(crate) context: Context,
-    pub(crate) children: Vec<Arc<Frame>>,
+    /// Children WITH their causal edge kind — see [`FrameKind`].
+    pub(crate) children: Vec<(FrameKind, Arc<Frame>)>,
     pub(crate) type_name: &'static str,
     pub(crate) attachments: Vec<Attachment>,
 }
 
 impl Frame {
+    /// Crate-private constructor — the only place a `Frame` is built. `context`
+    /// and `children` are computed by the caller; attachments start empty (only
+    /// capture hooks may push, and they run BEFORE the frame is shared).
+    fn new(
+        error: BoxError,
+        type_name: &'static str,
+        location: &'static Location<'static>,
+        context: Context,
+        children: Vec<(FrameKind, Arc<Frame>)>,
+    ) -> Frame {
+        Frame {
+            error,
+            location,
+            context,
+            children,
+            type_name,
+            attachments: Vec::new(),
+        }
+    }
+
     /// The single root-frame construction path: auto scope context, nested
     /// source chain, hook + counter fan-out. Every `Fault` root is born here
     /// — exactly one hook firing per constructed frame.
@@ -279,14 +367,7 @@ impl Frame {
     ) -> Arc<Frame> {
         let context = crate::profiling::current_scope_name().map_or(Context::None, Context::Scope);
         let children = walk_sources(&*error, location);
-        let mut frame = Frame {
-            error,
-            location,
-            context,
-            children,
-            type_name,
-            attachments: Vec::new(),
-        };
+        let mut frame = Frame::new(error, type_name, location, context, children);
         // Capture hooks run on `&mut Frame` BEFORE sharing — they may push
         // attachments. Order: capture (mutate) → share → sink-notify.
         crate::hook::run_capture_hooks(&mut frame);
@@ -310,10 +391,21 @@ impl Frame {
     pub fn context(&self) -> &Context {
         &self.context
     }
-    /// Child frames (the cause chain + raised contexts).
-    #[must_use]
-    pub fn children(&self) -> &[Arc<Frame>] {
-        &self.children
+    /// Child frames (the cause chain + raised contexts), without the edge
+    /// kinds — see [`Frame::child_edges`].
+    pub fn children(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Arc<Frame>> + DoubleEndedIterator + '_ {
+        self.children.iter().map(|(_, frame)| frame)
+    }
+
+    /// Child frames WITH their causal edge kind — whether each child is a
+    /// `source()` cause, a wrapped original, a retry attempt, or a batch
+    /// merge. The report renders these as distinct labels.
+    pub fn child_edges(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (FrameKind, &Arc<Frame>)> + DoubleEndedIterator + '_ {
+        self.children.iter().map(|(kind, frame)| (*kind, frame))
     }
     /// The type name of the error (for doctor-style debugging).
     #[must_use]
@@ -331,6 +423,21 @@ impl Frame {
         self.attachments.iter().find_map(Attachment::downcast::<T>)
     }
 
+    /// The first attached value of type `T` in this frame's SUBTREE, in
+    /// preorder (self first, then children depth-first).
+    #[must_use]
+    pub fn find_attachment_tree<T: 'static>(&self) -> Option<&T> {
+        fn walk<T: 'static>(frame: &Frame) -> Option<&T> {
+            frame.find_attachment::<T>().or_else(|| {
+                frame
+                    .children
+                    .iter()
+                    .find_map(|(_, child)| walk::<T>(child))
+            })
+        }
+        walk::<T>(self)
+    }
+
     /// Push an attachment onto this frame. Used by capture hooks
     /// ([`crate::hook::run_capture_hooks`]), which receive `&mut Frame`
     /// BEFORE the frame is wrapped in `Arc` — on a shared frame this is
@@ -341,6 +448,7 @@ impl Frame {
     /// Pre-order iterator over this frame and all descendants (self first,
     /// then children recursively). Explicit-stack implementation, no allocation
     /// beyond the stack Vec.
+    #[must_use]
     pub fn iter(self: &Arc<Frame>) -> FrameIter {
         FrameIter {
             stack: vec![Arc::clone(self)],
@@ -362,7 +470,7 @@ impl Iterator for FrameIter {
     fn next(&mut self) -> Option<Self::Item> {
         let frame = self.stack.pop()?;
         // Push children in reverse so they pop left-to-right.
-        for child in frame.children.iter().rev() {
+        for (_, child) in frame.children.iter().rev() {
             self.stack.push(Arc::clone(child));
         }
         Some(frame)
@@ -379,14 +487,13 @@ fn frame_from_error(
     location: &'static Location<'static>,
 ) -> Arc<Frame> {
     let children = walk_sources(&*error, location);
-    Arc::new(Frame {
+    Arc::new(Frame::new(
         error,
-        location,
-        context: Context::None,
-        children,
         type_name,
-        attachments: Vec::new(),
-    })
+        location,
+        Context::None,
+        children,
+    ))
 }
 
 impl fmt::Display for Frame {
@@ -405,7 +512,21 @@ impl fmt::Display for Frame {
 /// first-branch chain, mirroring the tree's causality.
 impl Error for Frame {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.children.first().map(|c| c.as_ref() as &dyn Error)
+        self.children.first().map(|(_, c)| c.as_ref() as &dyn Error)
+    }
+
+    /// Forward the wrapped error's provided data, and expose the frame's own
+    /// structured metadata through the same channel (DESIGN.md §11c
+    /// "capability ceiling") — generic middleware that knows nothing about
+    /// fast-observe can `request_ref::<Context>` / `request_ref::<Frame>` /
+    /// `request_ref::<&str>` (the type name) / `request_ref::<Location>` on
+    /// any `&dyn Error` the tree surfaces.
+    fn provide<'a>(&'a self, request: &mut core::error::Request<'a>) {
+        self.error.provide(request);
+        request.provide_ref::<Context>(&self.context);
+        request.provide_ref::<Location>(self.location);
+        request.provide_ref::<&'static str>(&self.type_name);
+        request.provide_ref::<Frame>(self);
     }
 }
 
@@ -527,7 +648,72 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
         );
         Self { root, error }
     }
+}
 
+/// Frame accessors that need no `E: Error` bound — kept outside the
+/// `E: Error` impl block so `Fault<BoxError>` (`Box<dyn Error>` does not
+/// itself implement `Error`) and [`FaultCollection`] can use them.
+impl<E: Send + Sync + Sized + 'static> Fault<E> {
+    /// The root frame (shared via Arc).
+    #[must_use]
+    pub fn frame(&self) -> &Frame {
+        &self.root
+    }
+
+    /// Pre-order iterator over every frame in the causal tree, starting at the root.
+    /// `&Fault` also implements `IntoIterator` (yielding the same frames).
+    #[must_use]
+    pub fn iter(&self) -> FrameIter {
+        self.root.iter()
+    }
+
+    /// Consume the fault and return the shared root frame.
+    ///
+    /// [`FaultCollection`] collects faults of any `E` — only the frames are kept.
+    #[must_use]
+    pub fn into_frame(self) -> Arc<Frame> {
+        self.root
+    }
+
+    /// The fault's policy, from the root error's [`crate::errors::CategoryTag`]
+    /// (provided through `Error::provide`) or a registry lookup by the
+    /// provided [`crate::errors::ErrorCode`]. `None` when the error isn't coded.
+    #[must_use]
+    pub fn policy(&self) -> Option<crate::Policy> {
+        frame_category(&self.root).map(crate::ErrorCategory::policy)
+    }
+
+    /// sysexits-style process exit code from the root error's category:
+    /// Content → `EX_DATAERR` (65), Transient → `EX_TEMPFAIL` (75),
+    /// Invariant/Fatal → `EX_SOFTWARE` (70), uncoded → 1.
+    ///
+    /// Category resolution is the same as [`Fault::policy`].
+    #[must_use]
+    pub fn exit_code(&self) -> std::process::ExitCode {
+        std::process::ExitCode::from(self.exit_code_raw())
+    }
+
+    /// The sysexits code as a raw `u8` — shared by [`Fault::exit_code`]
+    /// (the `Termination` value) and [`Fault::exit_with_report`] (the
+    /// `process::exit` argument).
+    fn exit_code_raw(&self) -> u8 {
+        /// sysexits.h `EX_DATAERR` — the input was wrong (Content).
+        const EX_DATAERR: u8 = 65;
+        /// sysexits.h `EX_SOFTWARE` — internal software error (Invariant/Fatal).
+        const EX_SOFTWARE: u8 = 70;
+        /// sysexits.h `EX_TEMPFAIL` — temporary failure, retry later (Transient).
+        const EX_TEMPFAIL: u8 = 75;
+        /// No sysexits equivalent — generic failure for uncoded errors.
+        const EX_GENERAL: u8 = 1;
+        match frame_category(&self.root) {
+            Some(crate::ErrorCategory::Content) => EX_DATAERR,
+            Some(crate::ErrorCategory::Transient) => EX_TEMPFAIL,
+            // Invariant/Fatal — plus any future category defaults to a
+            // generic software error rather than "success-adjacent" codes.
+            Some(_) => EX_SOFTWARE,
+            None => EX_GENERAL,
+        }
+    }
     /// Attach typed [`Context`] to this fault's root frame.
     ///
     /// The root frame must be uniquely owned (the normal case: you just
@@ -602,6 +788,15 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
         self.root.find_attachment::<T>()
     }
 
+    /// The first attached value of type `T` anywhere in the causal tree
+    /// (preorder: root first, then children depth-first). Rootcause-style
+    /// inspection: retry metadata, partial state, or a breadcrumb trail
+    /// attached on a CHILD frame stays findable.
+    #[must_use]
+    pub fn find_attachment_tree<T: 'static>(&self) -> Option<&T> {
+        self.root.find_attachment_tree::<T>()
+    }
+
     /// The current context on the root frame.
     #[must_use]
     pub fn context(&self) -> &Context {
@@ -614,8 +809,13 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     #[must_use]
     pub fn root_cause(&self) -> Arc<Frame> {
         let mut frame = Arc::clone(&self.root);
-        while let Some(first) = frame.children().first() {
-            frame = Arc::clone(first);
+        loop {
+            // Clone the child Arc before reassigning — the borrow must end
+            // first.
+            let Some(first) = frame.children().next().cloned() else {
+                break;
+            };
+            frame = first;
         }
         frame
     }
@@ -630,67 +830,60 @@ impl<E: Error + Send + Sync + Sized + 'static> Fault<E> {
     pub fn wrap<T: Error + Send + Sync + Sized + 'static>(self, err: T) -> Fault<T> {
         let mut fault = Fault::capture_typed(err, Location::caller());
         if let Some(root) = Arc::get_mut(&mut fault.root) {
-            root.children.push(self.root);
+            root.children.push((FrameKind::Wrap, self.root));
         }
         fault
     }
 }
 
-/// Frame accessors that need no `E: Error` bound — kept outside the
-/// `E: Error` impl block so `Fault<BoxError>` (`Box<dyn Error>` does not
-/// itself implement `Error`) and [`FaultCollection`] can use them.
+/// `fn main() -> Fault<E>` — the exit path IS the report (SURFACE.md §6a):
+/// the report renders to stderr and the process exits with the category's
+/// sysexits code ([`Fault::exit_code`]) instead of the generic `Error: {:?}`
+/// line `Result`'s `Termination` impl produces.
+///
+/// ```no_run
+/// # use fast_observe::Fault;
+/// # fn run() -> Fault { Fault::from("boom") }
+/// fn main() -> Fault {
+///     run()
+/// }
+/// ```
+///
+/// For the `fn main() -> Result<(), E>` form (the common case), use
+/// `#[fast_observe::main]` — the attribute wraps the body and routes the
+/// `Err` through this exact path.
+impl<E: Send + Sync + Sized + 'static> std::process::Termination for Fault<E> {
+    fn report(self) -> std::process::ExitCode {
+        self.exit_with_report()
+    }
+}
+
 impl<E: Send + Sync + Sized + 'static> Fault<E> {
-    /// The root frame (shared via Arc).
-    #[must_use]
-    pub fn frame(&self) -> &Frame {
-        &self.root
-    }
-
-    /// Pre-order iterator over every frame in the causal tree, starting at the root.
-    pub fn iter(&self) -> FrameIter {
-        self.root.iter()
-    }
-
-    /// Consume the fault and return the shared root frame.
+    /// Print the full report to stderr, then exit with the fault's sysexits
+    /// category code ([`Fault::exit_code`]). `-> !` so it can terminate a
+    /// `fn main` body from any arm of a match.
     ///
-    /// [`FaultCollection`] collects faults of any `E` — only the frames are kept.
-    #[must_use]
-    pub fn into_frame(self) -> Arc<Frame> {
-        self.root
-    }
-
-    /// The fault's policy, from the root error's [`crate::errors::CategoryTag`]
-    /// (provided through `Error::provide`) or a registry lookup by the
-    /// provided [`crate::errors::ErrorCode`]. `None` when the error isn't coded.
-    #[must_use]
-    pub fn policy(&self) -> Option<crate::Policy> {
-        frame_category(&self.root).map(crate::ErrorCategory::policy)
-    }
-
-    /// sysexits-style process exit code from the root error's category:
-    /// Content → `EX_DATAERR` (65), Transient → `EX_TEMPFAIL` (75),
-    /// Invariant/Fatal → `EX_SOFTWARE` (70), uncoded → 1.
-    ///
-    /// Category resolution is the same as [`Fault::policy`].
-    #[must_use]
-    pub fn exit_code(&self) -> std::process::ExitCode {
-        let code = match frame_category(&self.root) {
-            Some(crate::ErrorCategory::Content) => 65,
-            Some(crate::ErrorCategory::Transient) => 75,
-            // Invariant/Fatal — plus any future category defaults to a
-            // generic software error rather than "success-adjacent" codes.
-            Some(_) => 70,
-            None => 1,
-        };
-        std::process::ExitCode::from(code)
+    /// Shared by the `Termination for Fault<E>` impl (the `fn main() -> Fault`
+    /// exit path) and `#[fast_observe::main]`'s `Err` arm retargeting — one
+    /// render, one exit-code mapping, two entry points.
+    pub fn exit_with_report(self) -> ! {
+        // Infallible on stderr; ignore a closed stderr (e.g. daemonized).
+        let _ = std::io::stderr().write_fmt(format_args!("{}", crate::report_display(&self)));
+        // Flush before `process::exit` skips destructors: pending fastrace
+        // spans and buffered log records are exactly what you need when the
+        // process dies of this fault. Best-effort, no-op without the
+        // features.
+        crate::flush();
+        log::logger().flush();
+        std::process::exit(i32::from(self.exit_code_raw()))
     }
 }
 
 /// A frame's category: a provided [`crate::errors::CategoryTag`] first, then
 /// a registry lookup by the provided [`crate::errors::ErrorCode`]. `None`
-/// when neither source knows one. Mirrors `report::frame_category` (kept
-/// private there; both resolve through the same `Error::provide` channel).
-fn frame_category(frame: &Frame) -> Option<crate::ErrorCategory> {
+/// when neither source knows one. The single resolution through the
+/// `Error::provide` channel — `report.rs` and `diagnostic.rs` call this.
+pub(crate) fn frame_category(frame: &Frame) -> Option<crate::ErrorCategory> {
     if let Some(tag) = core::error::request_value::<crate::errors::CategoryTag>(frame.error()) {
         return Some(tag.0);
     }
@@ -719,18 +912,100 @@ fn frame_category(frame: &Frame) -> Option<crate::ErrorCategory> {
 /// Returns `Err(Fault<E>)` with the first failure when the policy is not
 /// [`crate::Policy::Retry`], or one fault wrapping all attempts after
 /// `max_attempts` Retry-policy failures.
+/// The sleep policy between retry attempts ([`retry_with_backoff`]).
+/// `sleep` is always injected by the caller (never called here) — wasm-safe
+/// by construction, per DESIGN.md §11b's verdict-table rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backoff {
+    /// No delay between attempts (`retry_with_policy` behavior).
+    None,
+    /// A fixed delay between attempts.
+    Fixed(std::time::Duration),
+    /// Exponential backoff: `base * factor^(attempt-1)`, capped at `max`.
+    Exponential {
+        /// First delay.
+        base: std::time::Duration,
+        /// Multiplier per attempt.
+        factor: u32,
+        /// Upper cap on any single delay.
+        max: std::time::Duration,
+    },
+}
+
+impl Backoff {
+    /// Maximum exponent applied in [`Backoff::Exponential`] — caps the
+    /// `factor^exp` product so the saturating arithmetic below can never
+    /// overflow even with `factor = u32::MAX` and an unbounded attempt count.
+    const MAX_EXPONENT: usize = 20;
+
+    /// The delay sequence as a pure, side-effect-free iterator — attempt
+    /// 1 first, one item per attempt, `None` meaning "no delay". Separating
+    /// the POLICY (this) from the MECHANISM (sleep + retry loop in
+    /// [`retry_with_backoff`]) makes the schedule unit-testable without
+    /// sleeping.
+    pub fn schedule(self) -> impl Iterator<Item = Option<std::time::Duration>> {
+        (1..).map(move |attempt| self.delay(attempt))
+    }
+
+    #[must_use]
+    fn delay(&self, attempt: usize) -> Option<std::time::Duration> {
+        match self {
+            Self::None => None,
+            Self::Fixed(d) => Some(*d),
+            Self::Exponential { base, factor, max } => {
+                // factor < 2 would not back OFF — coerced to the minimum
+                // sensible multiplier.
+                let factor = u128::from((*factor).max(2));
+                // attempt is 1-based; the first retry uses base. The exponent
+                // is capped so the product cannot overflow u128.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "the exponent is capped at MAX_EXPONENT, far below u32::MAX"
+                )]
+                let exp = (attempt - 1).min(Self::MAX_EXPONENT) as u32;
+                let mult = factor.saturating_pow(exp);
+                let delay_ns = base.as_nanos().saturating_mul(mult);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "value is clamped to u64::MAX immediately before the cast"
+                )]
+                let delay =
+                    std::time::Duration::from_nanos(delay_ns.min(u128::from(u64::MAX)) as u64);
+                Some(delay.min(*max))
+            }
+        }
+    }
+}
+
+/// Run `f`, retrying while failures have [`crate::Policy::Retry`] with a
+/// caller-supplied `sleep` between attempts (see [`retry_with_policy`] for
+/// the shared collection semantics; the `#[track_caller]` location is the
+/// same for both).
+///
+/// `sleep` runs ONLY between retryable attempts — the final attempt (or the
+/// first non-Retry failure) sleeps nothing. `sleep` is never called on wasm
+/// by this crate; the app decides what a `Duration` means there
+/// (gloo-timers, a no-op, …).
+///
+/// # Errors
+///
+/// Same contract as [`retry_with_policy`].
 #[track_caller]
-pub fn retry_with_policy<T, E, F>(
+pub fn retry_with_backoff<T, E, F, S>(
     label: &'static str,
     max_attempts: usize,
+    backoff: Backoff,
+    mut sleep: S,
     mut f: F,
 ) -> Result<T, E>
 where
     E: Error + Send + Sync + Sized + 'static,
     F: FnMut() -> core::result::Result<T, E>,
+    S: FnMut(std::time::Duration),
 {
     let max_attempts = max_attempts.max(1);
     let mut collection = FaultCollection::new();
+    let mut schedule = backoff.schedule();
     let mut attempts = 0usize;
     loop {
         match f() {
@@ -740,6 +1015,12 @@ where
                 attempts += 1;
                 if fault.policy() == Some(crate::Policy::Retry) && attempts < max_attempts {
                     collection.push(fault);
+                    // The schedule iterator is infinite — `None` here is
+                    // the ITEM (no delay); the iterator itself never ends.
+                    let delay = schedule.next().unwrap_or(None);
+                    if let Some(delay) = delay {
+                        sleep(delay);
+                    }
                     continue;
                 }
                 if !collection.is_empty()
@@ -748,11 +1029,39 @@ where
                     root.context = Context::Custom(
                         format!("{label}: failed after {attempts} attempts").into(),
                     );
-                    root.children.append(&mut collection.frames);
+                    root.children.extend(
+                        collection
+                            .frames
+                            .drain(..)
+                            .map(|frame| (FrameKind::Attempt, frame)),
+                    );
                 }
                 return Err(fault);
             }
         }
+    }
+}
+
+/// See [`retry_with_backoff`] with [`Backoff::None`] — no sleeping.
+///
+/// # Errors
+///
+/// Same contract as [`retry_with_backoff`].
+#[track_caller]
+pub fn retry_with_policy<T, E, F>(label: &'static str, max_attempts: usize, f: F) -> Result<T, E>
+where
+    E: Error + Send + Sync + Sized + 'static,
+    F: FnMut() -> core::result::Result<T, E>,
+{
+    retry_with_backoff(label, max_attempts, Backoff::None, |_| {}, f)
+}
+
+impl<E: Send + Sync + Sized + 'static> IntoIterator for &Fault<E> {
+    type Item = Arc<Frame>;
+    type IntoIter = FrameIter;
+
+    fn into_iter(self) -> FrameIter {
+        self.iter()
     }
 }
 
@@ -833,7 +1142,8 @@ impl FaultCollection {
     pub fn into_fault<T: Error + Send + Sync + Sized + 'static>(self, err: T) -> Fault<T> {
         let mut fault = Fault::new(err);
         if let Some(root) = Arc::get_mut(&mut fault.root) {
-            root.children.extend(self.frames);
+            root.children
+                .extend(self.frames.into_iter().map(|f| (FrameKind::Batch, f)));
         }
         fault
     }
@@ -844,7 +1154,8 @@ impl FaultCollection {
     pub fn into_fault_msg(self, msg: impl Into<Cow<'static, str>>) -> Fault {
         let mut fault = Fault::from_boxed(internal_err(msg));
         if let Some(root) = Arc::get_mut(&mut fault.root) {
-            root.children.extend(self.frames);
+            root.children
+                .extend(self.frames.into_iter().map(|f| (FrameKind::Batch, f)));
         }
         fault
     }
@@ -880,8 +1191,20 @@ impl<E: Send + Sync + Sized + 'static> FromIterator<Fault<E>> for FaultCollectio
 
 // ── ErrorExt — fluent raise on error types ─────────────────────────────────
 
+/// Fluent raise for any error type: `err.raise()` wraps it in a [`Fault`].
+///
+/// Blanket-implemented for every error type satisfying the fault contract
+/// (`Error + Send + Sync + Sized + 'static`); the trait is sealed, so
+/// downstream crates cannot add impls.
+#[diagnostic::on_unimplemented(
+    message = "implement `ErrorExt` via `error!` or on your own error type",
+    note = "ErrorExt is sealed; it is implemented for faults and error!-generated types"
+)]
 #[sealed]
 pub trait ErrorExt: Error + Send + Sync + Sized + 'static {
+    /// Wrap this error in a [`Fault`], capturing the caller's location.
+    ///
+    /// The single fluent-raise verb — [`Fault::new`] with `#[track_caller]`.
     #[track_caller]
     fn raise(self) -> Fault<Self> {
         Fault::new(self)
@@ -892,9 +1215,21 @@ impl<T: Error + Send + Sync + Sized + 'static> ErrorExt for T {}
 
 // ── ResultExt — context attachment + cross-type conversion ─────────────────
 
+/// Context attachment + cross-type conversion for `Result<T, E>`.
+///
+/// Blanket-implemented for every `Result<T, E>` whose `E` satisfies the
+/// fault contract (`Error + Send + Sync + Sized + 'static`); the trait is
+/// sealed, so these verbs are the single idiom for moving a plain `Result`
+/// into the fault contract.
+#[diagnostic::on_unimplemented(
+    message = "`ResultExt` methods are available on `fast_observe::Result` and `Result<T, E>` where E implements the fault contract",
+    note = "if you are calling `.report()`/`.wrap_msg()` on a plain std Result, convert with `Fault::new`/`error!` first"
+)]
 #[sealed]
 pub trait ResultExt {
+    /// The `Ok` payload type — passed through untouched on success.
     type Success;
+    /// The error type converted into [`Fault`] by these methods.
     type Error: Error + Send + Sync + Sized + 'static;
 
     /// Change the error context: convert `Err(E)` to `Err(Fault<A>)`.
@@ -923,6 +1258,27 @@ pub trait ResultExt {
     /// Returns `Err(Fault<BoxError>)` with `f()` when `self` is `Err`.
     #[track_caller]
     fn with_context(self, f: impl FnOnce() -> Cow<'static, str>) -> Result<Self::Success>;
+
+    /// The anyhow-verb alias for [`ResultExt::context`]. Identical semantics:
+    /// `Err` becomes `Fault<BoxError>` with `msg` as the root message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Fault<BoxError>)` with `msg` when `self` is `Err`.
+    #[track_caller]
+    fn wrap_msg(self, msg: impl Into<Cow<'static, str>>) -> Result<Self::Success>;
+
+    /// Attach a message as [`Context::Custom`](Context::Custom) while
+    /// PRESERVING the typed error `Self::Error` — the flatland-observe
+    /// `observed` verb. The message renders as `error (msg)` in Display/
+    /// reports, but `Fault::deref` still reaches the original `E`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Fault<Self::Error>)` carrying the message context on the
+    /// root frame when `self` is `Err`.
+    #[track_caller]
+    fn observed(self, msg: impl Into<Cow<'static, str>>) -> Result<Self::Success, Self::Error>;
 
     /// Attach debugging data when Err. On Ok the value passes through untouched.
     ///
@@ -993,7 +1349,7 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
                 let child = frame_from_error(Box::new(e), std::any::type_name::<E>(), location);
                 let mut fault = Fault::capture_boxed(internal_err(msg), location);
                 if let Some(root) = Arc::get_mut(&mut fault.root) {
-                    root.children.push(child);
+                    root.children.push((FrameKind::Wrap, child));
                 }
                 Err(fault)
             }
@@ -1006,6 +1362,21 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
         match self {
             Ok(v) => Ok(v),
             Err(e) => Err(e).context(f()),
+        }
+    }
+
+    #[track_caller]
+    #[cold]
+    fn wrap_msg(self, msg: impl Into<Cow<'static, str>>) -> Result<T> {
+        self.context(msg)
+    }
+
+    #[track_caller]
+    #[cold]
+    fn observed(self, msg: impl Into<Cow<'static, str>>) -> Result<T, E> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(e) => Err(Fault::new(e).set_context(Context::Custom(msg.into()))),
         }
     }
 
@@ -1035,10 +1406,10 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
         match self {
             Ok(v) => Some(v),
             Err(e) => {
-                record_error("reported");
+                record_error(REPORTED_KEY);
                 let location = Location::caller();
                 log::warn!(
-                    target: "fast_observe.error",
+                    target: crate::log_targets::ERROR,
                     "{}: {} (reported at {}:{})",
                     msg.into(),
                     e,
@@ -1053,8 +1424,17 @@ impl<T, E: Error + Send + Sync + Sized + 'static> ResultExt for core::result::Re
 
 // ── OptionExt — raise on None ──────────────────────────────────────────────
 
+/// Raise on `None` for any [`Option`], producing a [`Fault`].
+///
+/// Blanket-implemented for every `Option<T>`; the trait is sealed, so no
+/// downstream impls. [`OptionExt::ok_or_msg`] is the single verb.
+#[diagnostic::on_unimplemented(
+    message = "`OptionExt` is sealed and implemented for `Option<T>`",
+    note = "use `Option::ok_or`/`ok_or_else` for a plain Option"
+)]
 #[sealed]
 pub trait OptionExt {
+    /// The `Some` payload type.
     type Some;
 
     /// # Errors
@@ -1075,6 +1455,17 @@ impl<T> OptionExt for Option<T> {
             None => Err(Fault::from_boxed(internal_err(msg))),
         }
     }
+}
+
+/// Extract a panic payload as a string slice (`&str`/`String` downcasts
+/// only; anything else → `None`). Shared by the panic hook
+/// ([`crate::deploy`]) and the tokio join boundary
+/// ([`crate::tokio_ext`]) — one downcast chain, two `Any` containers.
+pub(crate) fn payload_str<'a>(payload: &'a (dyn Any + Send + 'static)) -> Option<&'a str> {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
 }
 
 /// A simple internal error for `ok_or_msg`, `bail!`-style message errors,
@@ -1099,13 +1490,19 @@ impl Error for InternalError {}
 
 // ── Macros ────────────────────────────────────────────────────────────────
 
-/// Bail with an error. Two forms:
+/// Bail with an error. Three forms:
 ///
 /// ```ignore
-/// bail!("something: {x}");                    // → Fault<BoxError>
+/// bail!("something: {x}");                    // → Fault<BoxError>, format!-interpolated
+/// bail!("literal message");                   // → Fault<BoxError> (same arm, zero args)
 /// bail!(Internal, "something: {x}");           // → Fault<Internal> with format! detail
 /// bail!(Internal { detail: "...".into() });    // → Fault<Internal> from struct
 /// ```
+///
+/// A literal first argument is always `format!`-interpolated (anyhow's
+/// `bail!` semantics): `{x}` captures `x` from scope. A NON-literal
+/// expression (`bail!(err)`, `bail!(MSG)`) goes through `Fault::from`
+/// untouched.
 #[macro_export]
 macro_rules! bail {
     ($type:ident, $fmt:literal $(, $arg:expr)* $(,)?) => {{
@@ -1113,11 +1510,31 @@ macro_rules! bail {
             $type { detail: format!($fmt $(, $arg)*) }
         ));
     }};
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {{
+        return ::core::result::Result::Err($crate::exn::Fault::from(
+            ::std::format!($fmt $(, $arg)*)
+        ));
+    }};
     ($err:expr) => {{ return ::core::result::Result::Err($crate::exn::Fault::from($err)); }};
 }
 
+/// Assert a condition, bailing with an error when false — the guard form
+/// of [`bail!`]:
+///
+/// ```ignore
+/// ensure!(x > 0, "x must be positive: {x}");      // → Fault<BoxError>, interpolated
+/// ensure!(x > 0, AppError { detail: "x too small".into() });
+/// ```
+///
+/// The literal form forwards to [`bail!`]'s `format!` arm, so `{x}`
+/// captures from scope.
 #[macro_export]
 macro_rules! ensure {
+    ($cond:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        if !($cond) {
+            $crate::bail!($fmt $(, $arg)*)
+        }
+    }};
     ($cond:expr, $err:expr $(,)?) => {{
         if !($cond) {
             $crate::bail!($err)
@@ -1135,24 +1552,32 @@ macro_rules! ensure {
 /// `&dyn Error`); the original `type_name` is preserved per frame. No hook
 /// fires for these frames — they are causes, not new constructions.
 #[cold]
-fn walk_sources(error: &dyn Error, location: &'static Location<'static>) -> Vec<Arc<Frame>> {
+fn walk_sources(
+    error: &(dyn Error + 'static),
+    location: &'static Location<'static>,
+) -> Vec<(FrameKind, Arc<Frame>)> {
+    // `Error::sources` is the std protocol the manual `error.source()`
+    // while-loop this replaced walked: it yields `self` then the entire
+    // cause chain, so `.skip(1)` drops the error itself and the
+    // (type_name, message) pairs come out in the same order.
     let mut chain = Vec::new();
-    let mut source = error.source();
-    while let Some(src) = source {
+    for src in error.sources().skip(1) {
         chain.push((std::any::type_name_of_val(src), src.to_string()));
-        source = src.source();
     }
-    // Fold from the deepest cause outward into a nested chain.
+    // Fold from the deepest cause outward into a nested chain. Every edge
+    // here is a `source()` cause — [`FrameKind::Source`].
     let mut children = Vec::new();
     for (type_name, msg) in chain.into_iter().rev() {
-        children = vec![Arc::new(Frame {
-            error: Box::new(InternalError(msg.into())),
-            location,
-            context: Context::None,
-            children,
-            type_name,
-            attachments: Vec::new(),
-        })];
+        children = vec![(
+            FrameKind::Source,
+            Arc::new(Frame::new(
+                Box::new(InternalError(msg.into())),
+                type_name,
+                location,
+                Context::None,
+                children,
+            )),
+        )];
     }
     children
 }
@@ -1174,51 +1599,86 @@ impl<E: Send + Sync + Sized + 'static> fmt::Debug for Fault<E> {
 /// a frame (attachment or child) gets ``-- ``, the rest `|-- `. Non-inline
 /// attachments are not rendered in-tree; the frame's own line gets a
 /// ` (+N more attachments)` suffix when N > 0.
-fn write_fault(f: &mut fmt::Formatter<'_>, frame: &Frame, prefix: &str) -> fmt::Result {
-    if let Some(code) = core::error::request_value::<crate::errors::ErrorCode>(frame.error()) {
-        write!(f, "[{}] ", code.0)?;
-    }
-    write!(f, "{}", frame.error)?;
-    let loc = frame.location;
-    write!(f, ", at {}:{}:{}", loc.file(), loc.line(), loc.column())?;
-    if !matches!(frame.context, Context::None) {
-        write!(f, " [{}]", frame.context)?;
-    }
-    let inline_count = frame
-        .attachments
-        .iter()
-        .filter(|a| a.placement == Placement::Inline)
-        .count();
-    let deferred = frame.attachments.len() - inline_count;
-    if deferred > 0 {
-        write!(f, " (+{deferred} more attachments)")?;
-    }
-    // Inline attachments are leading pseudo-children: they share the
-    // sibling last-ness with real children.
-    let total = inline_count + frame.children.len();
-    for (i, attachment) in frame
-        .attachments
-        .iter()
-        .filter(|a| a.placement == Placement::Inline)
-        .enumerate()
-    {
-        if i + 1 == total {
-            write!(f, "\n{prefix}`-- ")?;
-        } else {
-            write!(f, "\n{prefix}|-- ")?;
+fn write_fault(f: &mut fmt::Formatter<'_>, root: &Frame, prefix: &str) -> fmt::Result {
+    /// One frame's own line content (no connector): `[CODE] error, at
+    /// file:line:col [context] (+N more attachments)`.
+    fn write_frame_line(f: &mut fmt::Formatter<'_>, frame: &Frame) -> fmt::Result {
+        if let Some(code) = core::error::request_value::<crate::errors::ErrorCode>(frame.error()) {
+            write!(f, "[{}] ", code.0)?;
         }
-        write!(f, "* {attachment}")?;
+        write!(f, "{}", frame.error)?;
+        let loc = frame.location;
+        write!(f, ", at {}:{}:{}", loc.file(), loc.line(), loc.column())?;
+        if !matches!(frame.context, Context::None) {
+            write!(f, " [{}]", frame.context)?;
+        }
+        let inline_count = frame
+            .attachments
+            .iter()
+            .filter(|a| a.placement == Placement::Inline)
+            .count();
+        let deferred = frame.attachments.len() - inline_count;
+        if deferred > 0 {
+            write!(f, " (+{deferred} more attachments)")?;
+        }
+        Ok(())
     }
-    for (i, child) in frame.children.iter().enumerate() {
-        let last = inline_count + i + 1 == total;
-        let next_prefix = if last {
-            write!(f, "\n{prefix}`-- ")?;
-            format!("{prefix}    ")
+
+    // Explicit stack, not recursion: Debug rendering runs in processes that
+    // are already sick, and a degenerate deep tree must not overflow the
+    // stack. Entries borrow the frames (the tree outlives the render).
+    // `prefix` is the connector prefix inherited from the ancestors; `last`
+    // picks ``-- `` over `|-- ` (the root has neither).
+    struct Work<'a> {
+        frame: &'a Frame,
+        prefix: String,
+        last: bool,
+        is_root: bool,
+    }
+    let mut stack = vec![Work {
+        frame: root,
+        prefix: prefix.to_string(),
+        last: true,
+        is_root: true,
+    }];
+    while let Some(work) = stack.pop() {
+        let Work {
+            frame,
+            prefix,
+            last,
+            is_root,
+        } = work;
+        // `prefix` is the PARENT's connector prefix (used for this frame's
+        // own connector); this frame's subtree hangs off `own_prefix`.
+        let own_prefix = if is_root {
+            prefix.clone()
         } else {
-            write!(f, "\n{prefix}|-- ")?;
-            format!("{prefix}|   ")
+            write!(f, "\n{prefix}{}", if last { "`-- " } else { "|-- " })?;
+            format!("{prefix}{}", if last { "    " } else { "|   " })
         };
-        write_fault(f, child, &next_prefix)?;
+        write_frame_line(f, frame)?;
+        // Inline attachments are leading pseudo-children: they share the
+        // sibling last-ness with real children.
+        let inline: Vec<&Attachment> = frame
+            .attachments
+            .iter()
+            .filter(|a| a.placement == Placement::Inline)
+            .collect();
+        let total = inline.len() + frame.children.len();
+        for (i, attachment) in inline.iter().enumerate() {
+            let connector = if i + 1 == total { "`-- " } else { "|-- " };
+            write!(f, "\n{own_prefix}{connector}* {attachment}")?;
+        }
+        // Push children in reverse so they pop left-to-right (preorder).
+        for (i, (_, child)) in frame.children.iter().enumerate().rev() {
+            let last = inline.len() + i + 1 == total;
+            stack.push(Work {
+                frame: child,
+                prefix: own_prefix.clone(),
+                last,
+                is_root: false,
+            });
+        }
     }
     Ok(())
 }

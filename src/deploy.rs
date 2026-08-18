@@ -107,12 +107,24 @@ pub struct Deployment {
     /// `wire()` warns on target `fast_observe.deploy` and skips the filter.
     #[builder(default)]
     rust_log_filter: bool,
+    /// Route records at or above this level to a dedicated `Stderr`
+    /// appender instead of the main appenders (DESIGN.md §3
+    /// `.stderr_from(Level::Error)` — the standard ops split: errors to
+    /// stderr, everything else to stdout/file). Default: `None` =
+    /// single-dispatch (current behavior).
+    stderr_from: Option<log::Level>,
+    /// Static key-value context stamped on EVERY log record (app name,
+    /// version, deployment id, …). Zero TLS cost (logforth
+    /// `StaticDiagnostic`). Default: none.
+    #[builder(default)]
+    static_diag: Vec<(String, String)>,
 }
 
 /// Stdout layout selector for [`Deployment::layout`].
 ///
 /// [`Deployment::layout`]: DeploymentBuilder::layout
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, strum::EnumString)]
+#[strum(serialize_all = "lowercase")]
 pub enum LayoutChoice {
     /// Human-readable plain text (logforth default layout).
     #[default]
@@ -133,21 +145,74 @@ pub enum LayoutChoice {
 
 /// fastrace reporter selector for [`Deployment::traces`].
 ///
+/// The `ConsoleWith`/`Custom` variants exist only under cargo feature
+/// `fastrace`; without it the enum still compiles (the variants are
+/// `#[cfg]`'d out) and `wire()` ignores the field entirely.
+///
 /// [`Deployment::traces`]: DeploymentBuilder::traces
-#[derive(Debug, Default)]
+#[derive(Default, strum::EnumString)]
+#[strum(serialize_all = "lowercase")]
 pub enum TracesChoice {
     /// `ConsoleReporter` with `Config::default()` — spans print to stdout.
     #[default]
     Console,
+    /// `ConsoleReporter` with a tuned
+    /// [`fastrace::collector::Config`] — `report_interval` controls the
+    /// batch flush cadence (memory/latency tradeoff on a busy trace;
+    /// DESIGN.md §9c-ext). Not expressible as a string/`OBSERVE_*` env
+    /// value (a config object), so `#[strum(disabled)]`.
+    #[cfg(feature = "fastrace")]
+    #[strum(disabled)]
+    ConsoleWith(fastrace::collector::Config),
+    /// Any custom reporter (`ConsoleReporter`, the `otel` feature's
+    /// `OpenTelemetryReporter`, a [`crate::reporter::MultiReporter`]
+    /// fan-out, …) with its own tuned
+    /// [`fastrace::collector::Config`]. Not expressible as a string, so
+    /// `#[strum(disabled)]`.
+    #[cfg(feature = "fastrace")]
+    #[strum(disabled)]
+    Custom(
+        Box<dyn fastrace::collector::Reporter>,
+        fastrace::collector::Config,
+    ),
     /// No reporter is installed — `set_reporter` is skipped entirely, so
     /// spans accumulate nowhere and the `FastraceEvent` log appender +
     /// `FastraceDiagnostic` are left out of the pipeline.
     Off,
 }
 
+/// The standard "toggle requested but its cargo feature is not compiled
+/// in" warning on target `fast_observe.deploy` — one shape for the five
+/// feature-gated deployment toggles (syslog, journald, async appends,
+/// task-local diagnostic, rustlog filter).
+///
+/// `$toggle`: the field name as the user wrote it; `$feature`: the cargo
+/// feature; `$tail`: what happens instead ("skipping … ", "appenders stay
+/// synchronous", …).
+///
+/// Under `--all-features` every gate is open and none of the call sites
+/// compile in — the macro itself is then unused, which is expected.
+#[allow(
+    unused_macros,
+    reason = "used when any of the five feature-gated deployment toggles' cargo features is off"
+)]
+macro_rules! missing_feature_warn {
+    ($toggle:literal, $feature:literal, $tail:literal) => {{
+        log::warn!(
+            target: crate::log_targets::DEPLOY,
+            concat!(
+                $toggle,
+                " requested but cargo feature `",
+                $feature,
+                "` is not compiled in — ",
+                $tail
+            )
+        );
+    }};
+}
+
 /// Begin configuring the observability deployment — the entry point reads
 /// as a verb. Finish with [`DeploymentBuilder::init`].
-#[must_use]
 pub fn observe() -> DeploymentBuilder {
     Deployment::builder()
 }
@@ -170,7 +235,60 @@ impl<S: deployment_builder::State> DeploymentBuilder<S> {
     }
 }
 
+impl DeploymentConfig {
+    /// Build the config from the `OBSERVE_*` environment variables:
+    ///
+    /// | Env var               | Field                |
+    /// |-----------------------|----------------------|
+    /// | `OBSERVE_LOG`         | `level`              |
+    /// | `OBSERVE_PROFILE`     | `backends`           |
+    /// | `OBSERVE_ERROR_THROTTLE` | `error_hook_throttle` |
+    /// | `OBSERVE_LOG_DIR`     | `file_from_env`      |
+    ///
+    /// Unset variables stay `None`. Values are NOT validated here —
+    /// [`apply`](Self::apply) collects the parse errors. This is the
+    /// single env-read point (DESIGN.md §3 "single `EnvConfig`, parsed
+    /// once"): `wire()`/`config()` resolve every `OBSERVE_*` value
+    /// through `LazyLock` statics or through this method, never ad-hoc
+    /// re-reads.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            level: std::env::var(crate::env_vars::OBSERVE_LOG).ok(),
+            stdout: None,
+            layout: None,
+            file_from_env: std::env::var_os(crate::env_vars::OBSERVE_LOG_DIR)
+                .is_some()
+                .then_some(true),
+            backends: std::env::var(crate::env_vars::OBSERVE_PROFILE).ok(),
+            error_hook_throttle: std::env::var(crate::env_vars::OBSERVE_ERROR_THROTTLE)
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            traces: None,
+            panic_hook: None,
+            flush_on_exit: None,
+            syslog: None,
+            journald: None,
+            async_append: None,
+            task_local_diagnostic: None,
+            rust_log_filter: None,
+        }
+    }
+}
+
 impl Deployment {
+    /// A [`Deployment`] configured from the `OBSERVE_*` environment
+    /// variables — `OBSERVE_LOG` (level), `OBSERVE_PROFILE` (backend
+    /// mask), `OBSERVE_ERROR_THROTTLE`, `OBSERVE_LOG_DIR` (file appender
+    /// on). Unset variables leave the builder defaults. Unparseable values
+    /// are reported as [`ConfigError`]s — nothing is applied.
+    ///
+    /// # Errors
+    /// See [`DeploymentConfig::apply`].
+    pub fn from_env() -> Result<Self, Vec<ConfigError>> {
+        DeploymentConfig::from_env().apply(observe())
+    }
+
     /// Begin configuring from a [`DeploymentConfig`] — equivalent to
     /// `cfg.apply(observe())`. Finish with [`Deployment::init`].
     ///
@@ -212,6 +330,8 @@ impl Deployment {
             async_append,
             task_local_diagnostic,
             rust_log_filter,
+            stderr_from,
+            static_diag,
         } = self;
 
         // Fields consumed only under their cargo feature — mark them read in
@@ -238,7 +358,7 @@ impl Deployment {
         let mut appends: Vec<Box<dyn logforth::Append>> = Vec::new();
 
         #[cfg(feature = "fastrace")]
-        let traces_on = !matches!(traces, TracesChoice::Off);
+        let traces_on = !matches!(&traces, TracesChoice::Off);
 
         if stdout {
             let base = logforth::append::Stdout::default();
@@ -249,7 +369,7 @@ impl Deployment {
                 #[cfg(not(feature = "json"))]
                 LayoutChoice::Json => {
                     log::warn!(
-                        target: "fast_observe.deploy",
+                        target: crate::log_targets::DEPLOY,
                         "LayoutChoice::Json requested but cargo feature `json` is not compiled in — using the text layout"
                     );
                     base
@@ -261,7 +381,7 @@ impl Deployment {
                 #[cfg(not(feature = "layout-logfmt"))]
                 LayoutChoice::Logfmt => {
                     log::warn!(
-                        target: "fast_observe.deploy",
+                        target: crate::log_targets::DEPLOY,
                         "LayoutChoice::Logfmt requested but cargo feature `layout-logfmt` is not compiled in — using the text layout"
                     );
                     base
@@ -273,116 +393,152 @@ impl Deployment {
                 #[cfg(not(feature = "layout-gcl"))]
                 LayoutChoice::Gcl => {
                     log::warn!(
-                        target: "fast_observe.deploy",
+                        target: crate::log_targets::DEPLOY,
                         "LayoutChoice::Gcl requested but cargo feature `layout-gcl` is not compiled in — using the text layout"
                     );
                     base
                 }
             };
             #[cfg(feature = "log-async")]
-            appends.push(maybe_async("fast-observe-log-stdout", stdout, async_append));
+            appends.push(trap(
+                maybe_async("fast-observe-log-stdout", stdout, async_append),
+                "stdout",
+            ));
             #[cfg(not(feature = "log-async"))]
-            appends.push(Box::new(stdout));
+            appends.push(trap(stdout, "stdout"));
         }
         #[cfg(feature = "fastrace")]
         if traces_on {
-            appends.push(Box::new(logforth_append_fastrace::FastraceEvent::default()));
+            appends.push(trap(
+                logforth_append_fastrace::FastraceEvent::default(),
+                "fastrace-events",
+            ));
         }
         // Browser-only (`target_os = "unknown"` — see the `mod web` gate in
         // profiling.rs): on WASI the appender would call into wasm-bindgen
         // placeholder imports and panic the guest.
         #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
-        appends.push(Box::new(crate::profiling::web::WebConsoleAppend));
+        appends.push(trap(crate::profiling::web::WebConsoleAppend, "web-console"));
         #[cfg(feature = "file")]
         if file_from_env && let Some(file) = file_appender() {
             #[cfg(feature = "log-async")]
-            appends.push(maybe_async("fast-observe-log-file", file, async_append));
+            appends.push(trap(
+                maybe_async("fast-observe-log-file", file, async_append),
+                "file",
+            ));
             #[cfg(not(feature = "log-async"))]
-            appends.push(Box::new(file));
+            appends.push(trap(file, "file"));
         }
         #[cfg(all(feature = "log-syslog", unix))]
         if syslog {
             match logforth_append_syslog::SyslogBuilder::unix("/dev/log") {
-                Ok(builder) => appends.push(Box::new(builder.build())),
+                Ok(builder) => appends.push(trap(builder.build(), "syslog")),
                 Err(e) => log::warn!(
-                    target: "fast_observe.deploy",
+                    target: crate::log_targets::DEPLOY,
                     "failed to connect syslog socket /dev/log: {e} — skipping the syslog appender"
                 ),
             }
         }
         #[cfg(not(all(feature = "log-syslog", unix)))]
         if syslog {
-            log::warn!(
-                target: "fast_observe.deploy",
-                "syslog requested but cargo feature `log-syslog` is not compiled in (or the target is not unix) — skipping the syslog appender"
-            );
+            missing_feature_warn!("syslog", "log-syslog", "skipping the syslog appender");
         }
         #[cfg(all(feature = "log-journald", unix))]
         if journald {
             match logforth_append_journald::Journald::new() {
-                Ok(journald) => appends.push(Box::new(journald)),
+                Ok(journald) => appends.push(trap(journald, "journald")),
                 Err(e) => log::warn!(
-                    target: "fast_observe.deploy",
+                    target: crate::log_targets::DEPLOY,
                     "journald unavailable: {e} — skipping the journald appender"
                 ),
             }
         }
         #[cfg(not(all(feature = "log-journald", unix)))]
         if journald {
-            log::warn!(
-                target: "fast_observe.deploy",
-                "journald requested but cargo feature `log-journald` is not compiled in (or the target is not unix) — skipping the journald appender"
-            );
+            missing_feature_warn!("journald", "log-journald", "skipping the journald appender");
         }
         #[cfg(not(feature = "log-async"))]
         if async_append {
-            log::warn!(
-                target: "fast_observe.deploy",
-                "async_append requested but cargo feature `log-async` is not compiled in — appenders stay synchronous"
-            );
+            missing_feature_warn!("async_append", "log-async", "appenders stay synchronous");
         }
         #[cfg(not(feature = "diag-task-local"))]
         if task_local_diagnostic {
-            log::warn!(
-                target: "fast_observe.deploy",
-                "task_local_diagnostic requested but cargo feature `diag-task-local` is not compiled in — skipping the diagnostic"
+            missing_feature_warn!(
+                "task_local_diagnostic",
+                "diag-task-local",
+                "skipping the diagnostic"
             );
         }
         #[cfg(not(feature = "filter-rustlog"))]
         if rust_log_filter {
-            log::warn!(
-                target: "fast_observe.deploy",
-                "rust_log_filter requested but cargo feature `filter-rustlog` is not compiled in — skipping the filter"
-            );
+            missing_feature_warn!("rust_log_filter", "filter-rustlog", "skipping the filter");
         }
 
-        // 3. Build the logforth pipeline, mirroring `hook::init()`'s
-        // composition (multi-dispatch is a later refinement).
+        // 3. Build the logforth pipeline (multi-dispatch when
+        // `stderr_from` is set: the main appenders get records below the
+        // split level, a dedicated `Stderr` appender gets records at/above
+        // it — the standard ops split, DESIGN.md §3).
+        let split_level = stderr_from.map(to_logforth_level);
         let mut builder = logforth::starter_log::builder();
+        // Shared dispatch config (diagnostics + optional rustlog filter)
+        // — used by the main dispatch and the stderr split dispatch alike.
+        let common = |d: logforth::core::DispatchBuilder<false>| {
+            let d = d.diagnostic(logforth::diagnostic::ThreadLocalDiagnostic::default());
+            #[cfg(feature = "fastrace")]
+            let d = if traces_on {
+                d.diagnostic(logforth_diagnostic_fastrace::FastraceDiagnostic::default())
+            } else {
+                d
+            };
+            #[cfg(feature = "diag-task-local")]
+            let d = if task_local_diagnostic {
+                d.diagnostic(logforth_diagnostic_task_local::TaskLocalDiagnostic::default())
+            } else {
+                d
+            };
+            let d = if static_diag.is_empty() {
+                d
+            } else {
+                d.diagnostic(logforth::diagnostic::StaticDiagnostic::new(
+                    static_diag.iter().cloned().collect(),
+                ))
+            };
+            #[cfg(feature = "filter-rustlog")]
+            let d = if rust_log_filter {
+                d.filter(build_rust_log_filter())
+            } else {
+                d
+            };
+            d
+        };
+
         let mut appends = appends.into_iter();
         if let Some(first) = appends.next() {
-            builder = builder.dispatch(|d| {
-                let d = d.diagnostic(logforth::diagnostic::ThreadLocalDiagnostic::default());
-                #[cfg(feature = "fastrace")]
-                let d = if traces_on {
-                    d.diagnostic(logforth_diagnostic_fastrace::FastraceDiagnostic::default())
-                } else {
-                    d
+            let main = |d: logforth::core::DispatchBuilder<false>| {
+                let d = match split_level {
+                    Some(lv) => d.filter(logforth::record::LevelFilter::MoreVerbose(lv)),
+                    None => d,
                 };
-                #[cfg(feature = "diag-task-local")]
-                let d = if task_local_diagnostic {
-                    d.diagnostic(logforth_diagnostic_task_local::TaskLocalDiagnostic::default())
-                } else {
-                    d
-                };
-                #[cfg(feature = "filter-rustlog")]
-                let d = if rust_log_filter {
-                    d.filter(build_rust_log_filter())
-                } else {
-                    d
-                };
+                let d = common(d);
                 let d = d.append(first);
                 appends.fold(d, logforth::core::DispatchBuilder::append)
+            };
+            builder = builder.dispatch(main);
+
+            if let Some(lv) = split_level {
+                builder = builder.dispatch(|d| {
+                    let d = d.filter(logforth::record::LevelFilter::MoreSevereEqual(lv));
+                    let d = common(d);
+                    d.append(trap(logforth::append::Stderr::default(), "stderr-split"))
+                });
+            }
+        } else if split_level.is_some() && !static_diag.is_empty() {
+            // No main appenders (logging compiled out), but the caller still
+            // configured a split and static context — keep a stderr-only
+            // dispatch so error records aren't silently dropped.
+            builder = builder.dispatch(|d| {
+                let d = common(d);
+                d.append(trap(logforth::append::Stderr::default(), "stderr-split"))
             });
         }
 
@@ -396,14 +552,36 @@ impl Deployment {
         log::set_max_level(resolve_level(level));
 
         // 6. Fastrace reporter (feature `fastrace`); `Off` skips
-        // `set_reporter` entirely.
+        // `set_reporter` entirely. `ConsoleWith`/`Custom` carry a tuned
+        // [`Config`](fastrace::collector::Config) (`report_interval` — batch
+        // flush cadence); `Custom` takes the reporter too.
         #[cfg(feature = "fastrace")]
         if traces_on {
-            fastrace::set_reporter(
-                fastrace::collector::ConsoleReporter,
-                fastrace::collector::Config::default(),
-            );
+            match traces {
+                TracesChoice::Console | TracesChoice::Off => fastrace::set_reporter(
+                    fastrace::collector::ConsoleReporter,
+                    fastrace::collector::Config::default(),
+                ),
+                TracesChoice::ConsoleWith(config) => {
+                    fastrace::set_reporter(fastrace::collector::ConsoleReporter, config);
+                }
+                TracesChoice::Custom(reporter, config) => {
+                    fastrace::set_reporter(ReporterAdapter(reporter), config);
+                }
+            }
         }
+
+        // 6b. wasm32-unknown-unknown (browser): register the pagehide
+        // listener so the tail of the trace is flushed when the tab closes
+        // or navigates away (feature `web` — where `install_unload_flush`
+        // only exists + fastrace is on).
+        #[cfg(all(
+            feature = "web",
+            feature = "fastrace",
+            target_arch = "wasm32",
+            target_os = "unknown"
+        ))]
+        crate::profiling::web::install_unload_flush();
 
         // 7. Panic hook — after the logger is live, so panic logs have
         // somewhere to go.
@@ -517,12 +695,10 @@ impl DeploymentConfig {
                 None
             }
         });
-        let layout = layout.and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "text" => Some(LayoutChoice::Text),
-            "json" => Some(LayoutChoice::Json),
-            "logfmt" => Some(LayoutChoice::Logfmt),
-            "gcl" => Some(LayoutChoice::Gcl),
-            _ => {
+        let layout = layout.and_then(|value| {
+            if let Ok(layout) = value.trim().to_ascii_lowercase().parse::<LayoutChoice>() {
+                Some(layout)
+            } else {
                 errors.push(ConfigError {
                     field: "layout",
                     value,
@@ -543,10 +719,10 @@ impl DeploymentConfig {
                 None
             }
         });
-        let traces = traces.and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "console" => Some(TracesChoice::Console),
-            "off" => Some(TracesChoice::Off),
-            _ => {
+        let traces = traces.and_then(|value| {
+            if let Ok(traces) = value.trim().to_ascii_lowercase().parse::<TracesChoice>() {
+                Some(traces)
+            } else {
                 errors.push(ConfigError {
                     field: "traces",
                     value,
@@ -578,6 +754,8 @@ impl DeploymentConfig {
             async_append: async_append.unwrap_or(base.async_append),
             task_local_diagnostic: task_local_diagnostic.unwrap_or(base.task_local_diagnostic),
             rust_log_filter: rust_log_filter.unwrap_or(base.rust_log_filter),
+            stderr_from: base.stderr_from,
+            static_diag: base.static_diag,
         })
     }
 }
@@ -611,14 +789,19 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Install a panic hook that logs the panic as a structured error event
-/// THROUGH the log pipeline (target `fast_observe.panic`, kv fields
-/// `panic_file`/`panic_line`, message = the panic payload string), then
-/// CHAINS to the previously installed hook — composability: never stomp.
+/// Install a panic hook that routes the panic through the ERROR pipeline:
+/// it constructs a [`Fault<PanicError>`] so the panic is counted in
+/// `error_counts`, fires capture hooks (backtrace attachment), and is
+/// logged/rendered by the error hooks per `OBSERVE_REPORT` — a panic and a
+/// returned error are indistinguishable in a crash log (DESIGN.md §9b.3).
+/// The real panic location rides as the `panic_location` attachment
+/// (a `std::panic::Location` cannot be fabricated from the borrowed
+/// runtime `PanicHookInfo` location). Then CHAINS to the previously
+/// installed hook — composability: never stomp.
 ///
-/// Category mapping: a panic is an unrecovered bug surfaced at runtime,
-/// conceptually [`ErrorCategory::Fatal`](crate::ErrorCategory::Fatal)
-/// events; logging them as structured errors makes a panic and a returned
-/// error indistinguishable in a crash log (DESIGN.md §9b.3).
+/// Category mapping: a panic is an unrecovered bug surfaced at runtime —
+/// [`PanicError`] provides [`ErrorCategory::Fatal`](crate::ErrorCategory::Fatal),
+/// so the report carries the fatal policy line.
 ///
 /// Chaining is `take_hook` + `set_hook`, not `std::panic::update_hook`:
 /// `update_hook` is still unstable (feature `panic_update_hook`,
@@ -630,24 +813,52 @@ impl std::error::Error for ConfigError {}
 /// log, unchanged.
 ///
 /// [rust#92649]: https://github.com/rust-lang/rust/issues/92649
+/// A panic surfaced as an error — routes panics through the SAME pipeline
+/// as returned errors (DESIGN.md §9b.3: indistinguishable in a crash log):
+/// constructing a `Fault<PanicError>` in the panic hook fires the capture
+/// hooks (backtrace attachment when enabled), the error hooks (the default
+/// hook logs/renders per `OBSERVE_REPORT`), and the error counters under
+/// this type name. `provide` marks the category [`ErrorCategory::Fatal`]
+/// ([`ErrorCategory::Fatal`](crate::ErrorCategory::Fatal)), so the report
+/// carries the fatal policy line.
+#[derive(Debug)]
+struct PanicError {
+    payload: String,
+}
+
+impl std::fmt::Display for PanicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "panic: {}", self.payload)
+    }
+}
+
+impl std::error::Error for PanicError {
+    fn provide<'a>(&'a self, request: &mut core::error::Request<'a>) {
+        request.provide_value(crate::errors::CategoryTag(crate::ErrorCategory::Fatal));
+    }
+}
+
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string payload>");
-        match info.location() {
-            Some(location) => log::error!(
-                target: "fast_observe.panic",
-                panic_file = location.file(),
-                panic_line = location.line();
-                "panic: {payload}"
-            ),
-            None => log::error!(target: "fast_observe.panic", "panic: {payload}"),
-        }
+        let payload = crate::exn::payload_str(info.payload())
+            .unwrap_or("<non-string payload>")
+            .to_string();
+        let location = info.location().map_or_else(
+            || "<unknown>".to_string(),
+            |l| format!("{}:{}", l.file(), l.line()),
+        );
+        // Contain: a panic while REPORTING a panic (e.g. OOM in fault
+        // construction) must not abort inside the hook — chain regardless.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The frame's `location:` is this crate's construction site
+            // (a `std::panic::Location` cannot be fabricated from the
+            // runtime-reported `PanicHookInfo::location`, which is neither
+            // `'static` nor the same type) — the REAL panic location rides
+            // as the `panic_location` attachment.
+            let _fault = crate::exn::Fault::new(PanicError { payload })
+                .attach_key("panic_location", location);
+        }));
         // Chain — never stomp the previous hook (the cargo test harness
         // hook, a wasm `console_error_panic_hook`, …).
         previous(info);
@@ -690,7 +901,7 @@ fn install_exit_flush() {
     unsafe {
         if libc::atexit(fastrace_flush_trampoline) != 0 {
             log::warn!(
-                target: "fast_observe.deploy",
+                target: crate::log_targets::DEPLOY,
                 "libc::atexit registration failed — exit flush will not run on normal exit"
             );
         }
@@ -711,18 +922,137 @@ fn resolve_level(explicit: Option<log::LevelFilter>) -> log::LevelFilter {
     if let Some(level) = explicit {
         return level;
     }
-    for var in ["OBSERVE_LOG", "RUST_LOG"] {
+    for var in [crate::env_vars::OBSERVE_LOG, crate::env_vars::RUST_LOG] {
         if let Ok(value) = std::env::var(var) {
             match value.trim().parse::<log::LevelFilter>() {
                 Ok(level) => return level,
                 Err(_) => log::warn!(
-                    target: "fast_observe.deploy",
+                    target: crate::log_targets::DEPLOY,
                     "invalid {var}={value:?}; expected off|error|warn|info|debug|trace — falling through"
                 ),
             }
         }
     }
     log::LevelFilter::Info
+}
+
+/// Map a `log::Level` to logforth's extended `record::Level`: the log
+/// facade only ever produces the five standard levels, while logforth's
+/// enum carries OTel-style offsets (Trace2..Fatal4) — the standard levels
+/// map to their base discriminants. Used for the `stderr_from` split
+/// filters.
+fn to_logforth_level(level: log::Level) -> logforth::record::Level {
+    match level {
+        log::Level::Error => logforth::record::Level::Error,
+        log::Level::Warn => logforth::record::Level::Warn,
+        log::Level::Info => logforth::record::Level::Info,
+        log::Level::Debug => logforth::record::Level::Debug,
+        log::Level::Trace => logforth::record::Level::Trace,
+    }
+}
+
+/// Route an appender's failures through the log facade + fastrace event
+/// stream instead of logforth-core's hardcoded stderr dump (D21: "a broken
+/// appender must never break the app"). The FIRST failure per appender is
+/// reported; later failures are swallowed, so a wedged appender cannot
+/// starve the caller (and the report cannot recursively re-enter the same
+/// failing appender through our own `log::error!`).
+///
+/// [`TrapAppender`] wraps every deployment appender — see [`TrapAppender`].
+fn trap(
+    append: impl Into<Box<dyn logforth::Append>>,
+    name: &'static str,
+) -> Box<dyn logforth::Append> {
+    Box::new(TrapAppender::new(append.into(), name))
+}
+
+/// An [`Append`](logforth::Append) wrapper that converts a failed
+/// `append`/`flush` into a structured `fast_observe.deploy` error event
+/// (+ fastrace `error` span event under feature `fastrace`) instead of
+/// logforth-core's unconditional stderr fallback.
+///
+/// Isolation story (DESIGN.md §3): a broken destination (full disk, dead
+/// syslog socket, …) must not break the application — the error is still
+/// RECORDED (observability), but the record is dropped at this appender.
+#[derive(Debug)]
+struct TrapAppender {
+    inner: Box<dyn logforth::Append>,
+    name: &'static str,
+    reported: std::sync::OnceLock<()>,
+}
+
+impl TrapAppender {
+    fn new(inner: Box<dyn logforth::Append>, name: &'static str) -> Self {
+        Self {
+            inner,
+            name,
+            reported: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Report an appender failure — once per appender, through the log
+    /// facade + the fastrace event stream under `fastrace`.
+    fn report(&self, err: &logforth::Error) {
+        let _: &() = self.reported.get_or_init(|| {
+            log::error!(
+                target: crate::log_targets::DEPLOY,
+                appender = self.name;
+                "log appender failed: {err} — records to this destination are being dropped",
+            );
+            #[cfg(feature = "fastrace")]
+            fastrace::local::LocalSpan::add_event(
+                fastrace::Event::new("log_appender_failure").with_properties(|| {
+                    use std::borrow::Cow;
+                    [
+                        (Cow::Borrowed("appender"), Cow::Borrowed(self.name)),
+                        (Cow::Borrowed("error"), Cow::Owned(err.to_string())),
+                    ]
+                }),
+            );
+        });
+    }
+}
+
+impl logforth::Append for TrapAppender {
+    fn append(
+        &self,
+        record: &logforth::record::Record,
+        diags: &[Box<dyn logforth::diagnostic::Diagnostic>],
+    ) -> Result<(), logforth::Error> {
+        match self.inner.append(record, diags) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.report(&err);
+                // Swallow: a broken appender must never propagate failure
+                // into the log caller (isolation), but the failure is now
+                // visible through observability.
+                Ok(())
+            }
+        }
+    }
+
+    fn flush(&self) -> Result<(), logforth::Error> {
+        match self.inner.flush() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.report(&err);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Object-safe bridge: fastrace's `set_reporter` takes `impl Reporter` (a
+/// concrete type), but [`TracesChoice::Custom`] stores a `Box<dyn Reporter>`
+/// — this adapter restores the concrete impl by delegating.
+#[cfg(feature = "fastrace")]
+struct ReporterAdapter(Box<dyn fastrace::collector::Reporter>);
+
+#[cfg(feature = "fastrace")]
+impl fastrace::collector::Reporter for ReporterAdapter {
+    fn report(&mut self, spans: Vec<fastrace::collector::SpanRecord>) {
+        self.0.report(spans);
+    }
 }
 
 /// Wrap an appender in `logforth_append_async::AsyncBuilder` when `enabled`
@@ -751,7 +1081,7 @@ fn maybe_async(
 #[cfg(feature = "filter-rustlog")]
 fn build_rust_log_filter() -> logforth_filter_rustlog::RustLogFilter {
     use logforth_filter_rustlog::RustLogFilterBuilder;
-    match std::env::var("OBSERVE_LOG") {
+    match std::env::var(crate::env_vars::OBSERVE_LOG) {
         Ok(spec) => RustLogFilterBuilder::from_spec(spec).build(),
         Err(_) => RustLogFilterBuilder::from_default_env_or("info").build(),
     }
@@ -761,11 +1091,11 @@ fn build_rust_log_filter() -> logforth_filter_rustlog::RustLogFilter {
 /// directory. Logs roll into `<dir>/app.log`.
 #[cfg(feature = "file")]
 fn file_appender() -> Option<logforth_append_file::File> {
-    let dir = std::env::var("OBSERVE_LOG_DIR").ok()?;
+    let dir = std::env::var(crate::env_vars::OBSERVE_LOG_DIR).ok()?;
     match logforth_append_file::FileBuilder::new(dir, "app.log").build() {
         Ok(file) => Some(file),
         Err(e) => {
-            log::error!(target: "fast_observe.deploy", "failed to build file appender: {e}");
+            log::error!(target: crate::log_targets::DEPLOY, "failed to build file appender: {e}");
             None
         }
     }
@@ -987,7 +1317,9 @@ mod tests {
         );
         // Env vars are process-global and racy under the test harness; only
         // assert the no-env fallback when the vars are absent.
-        if std::env::var_os("OBSERVE_LOG").is_none() && std::env::var_os("RUST_LOG").is_none() {
+        if std::env::var_os(crate::env_vars::OBSERVE_LOG).is_none()
+            && std::env::var_os(crate::env_vars::RUST_LOG).is_none()
+        {
             assert_eq!(resolve_level(None), log::LevelFilter::Info);
         }
     }

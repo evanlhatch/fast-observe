@@ -5,10 +5,10 @@
 use fast_observe::diagnostic::{Diagnostic, SourceSpan, eprint_diagnostic, register_source};
 use fast_observe::{Severity, render_diagnostic};
 
-/// Test error enum — registers one code so the registry-note path in
-/// `build_report` is exercised with a live entry (this binary links only
-/// fast-observe, so the registry contents here are exactly what this file
-/// registers).
+// Test error enum — registers one code so the registry-note path in
+// `build_report` is exercised with a live entry (this binary links only
+// fast-observe, so the registry contents here are exactly what this file
+// registers).
 fast_observe::error! {
     /// Errors of the diagnostic test.
     #[derive(Debug)]
@@ -167,6 +167,61 @@ fn diagnostic_display_and_error_impl() {
     assert_eq!(diag.to_string(), "[E042] something broke");
     fn assert_error<T: std::error::Error>(_: &T) {}
     assert_error(&diag);
+}
+
+#[test]
+fn fault_renders_as_diagnostic() {
+    // Notes render only when a source group resolves — the synthetic
+    // `<unknown>` span faults carry fails to fetch unless registered.
+    register_source("<unknown>", "");
+    // error! emits one struct per variant (the enum wraps them in tuple
+    // variants) — construct the variant struct directly.
+    let fault = fast_observe::Fault::new(BadWidget {
+        name: "gizmo".into(),
+    });
+    let out = fast_observe::diagnostic::render_any(&fault);
+    assert!(out.contains("[E777]"), "missing code slot: {out:?}");
+    assert!(
+        out.contains("bad widget: gizmo"),
+        "missing bare error message: {out:?}"
+    );
+    // Registry advice (from the variant's doc line) renders as a note.
+    assert!(
+        out.contains("bad widget"),
+        "missing registry advice note: {out:?}"
+    );
+}
+
+#[test]
+fn uncoded_fault_uses_type_name() {
+    let fault = fast_observe::Fault::from("boom");
+    let out = fast_observe::diagnostic::render_any(&fault);
+    // Uncoded fault: the code slot carries the short type name.
+    assert!(
+        out.contains("[InternalError]"),
+        "missing type-name code slot: {out:?}"
+    );
+    assert!(out.contains("boom"), "missing message: {out:?}");
+}
+
+#[test]
+fn to_diagnostic_identity() {
+    use fast_observe::diagnostic::ToDiagnostic;
+    let diag = Diagnostic::error("E042", "something broke").with_advice("check it");
+    let back = diag.to_diagnostic();
+    assert_eq!(back.code, diag.code);
+    assert_eq!(back.severity, diag.severity);
+    assert_eq!(back.message, diag.message);
+    assert_eq!(back.labels, diag.labels);
+    assert_eq!(back.advice, diag.advice);
+}
+
+#[test]
+fn eprint_any_no_panic() {
+    let fault = fast_observe::Fault::from("to stderr");
+    fast_observe::diagnostic::eprint_any(&fault);
+    let diag = Diagnostic::error("E001", "diagnostic to stderr");
+    fast_observe::diagnostic::eprint_any(&diag);
 }
 
 #[cfg(feature = "serde")]

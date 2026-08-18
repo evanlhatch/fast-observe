@@ -113,16 +113,37 @@ fn redact_location(text: &str) -> String {
     out
 }
 
+/// The fingerprint hashes the location — redact it for the same reason.
+fn redact_volatile(text: &str) -> String {
+    let text = redact_location(text);
+    text.lines()
+        .map(|line| {
+            if line.starts_with("fingerprint: ") {
+                "fingerprint: [FINGERPRINT]".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn report_text_snapshot() {
     let fault = snap_fault();
-    insta::assert_snapshot!(redact_location(&render_report(&fault)));
+    insta::assert_snapshot!(redact_volatile(&render_report(&fault)));
 }
 
 #[test]
 fn fault_debug_tree_snapshot() {
     let fault = snap_fault();
     insta::assert_snapshot!(redact_location(&format!("{fault:?}")));
+}
+
+#[test]
+fn redact_volatile_only_touches_volatile() {
+    let redacted = redact_volatile("fingerprint: deadbeef\nerror: x");
+    assert_eq!(redacted, "fingerprint: [FINGERPRINT]\nerror: x");
 }
 
 #[test]

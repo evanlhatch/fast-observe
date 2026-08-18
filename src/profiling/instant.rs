@@ -8,12 +8,13 @@
 //! spans. `print_breakdown()` (in `crate::breakdown`) derives the per-phase
 //! nanosecond breakdown from the span tree.
 //!
-//! Timing uses [`web_time::Instant`] (see `clock.rs`) — wasm-safe. Storage
+//! Timing uses `web_time::Instant` (see `clock.rs`) — wasm-safe. Storage
 //! is `Cell<Vec>` (take/set) — no `RefCell` borrow states, so instrumentation
 //! can never panic on reentrancy.
 
 use super::clock;
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::time::Duration;
 
 thread_local! {
@@ -22,14 +23,20 @@ thread_local! {
     static FRAME_BOUNDARIES: Cell<Vec<usize>> = Cell::new(Vec::new());
     /// Absolute count of spans ever removed from `FINISHED`. Frame
     /// boundaries are stored absolute; subtract this to rebase.
-    static DRAIN_BASE: Cell<usize> = Cell::new(0);
+    static DRAIN_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Take/mutate/set dance for a thread-local `Cell<Vec<T>>` — reentrancy
 /// panic-safe: the cell is empty while `f` runs, so nested access sees an
 /// empty vec instead of a `RefCell`-style borrow panic.
+///
+/// Uses `try_with` and silently skips when the TLS slot is already
+/// destroyed: `InstantGuard::drop` can run during thread teardown, and
+/// `LocalKey::with` would panic there — a panic inside `Drop` during
+/// unwinding aborts the process. A skipped finalize loses at most the
+/// exiting thread's tail spans — acceptable.
 fn with_tl<T>(cell: &'static std::thread::LocalKey<Cell<Vec<T>>>, f: impl FnOnce(&mut Vec<T>)) {
-    cell.with(|c| {
+    let _ = cell.try_with(|c| {
         let mut v = c.take();
         f(&mut v);
         c.set(v);
@@ -40,10 +47,17 @@ fn with_tl<T>(cell: &'static std::thread::LocalKey<Cell<Vec<T>>>, f: impl FnOnce
 /// origin), depth.
 #[derive(Debug, Clone)]
 pub struct SpanRecord {
+    /// The scope name passed to `enter`/`scope!`.
     pub name: &'static str,
+    /// Optional tag — a secondary label for the span.
     pub tag: Option<&'static str>,
+    /// Start timestamp, in ns since the clock's process origin
+    /// ([`crate::profiling::clock::now_ns`]).
     pub start_ns: u64,
+    /// End timestamp, in ns since the same origin. Set on guard drop;
+    /// equals `start_ns` for zero-length spans.
     pub end_ns: u64,
+    /// Nesting depth — 0 for spans entered at the top of the stack.
     pub depth: u32,
 }
 
@@ -75,7 +89,10 @@ pub fn enter(name: &'static str, tag: Option<&'static str>) -> InstantGuard {
             depth: d,
         });
     });
-    InstantGuard { depth: Some(depth) }
+    InstantGuard {
+        depth: Some(depth),
+        _not_send: PhantomData,
+    }
 }
 
 /// Guard — records the end timestamp on drop, moves span to `FINISHED`.
@@ -88,12 +105,19 @@ pub fn enter(name: &'static str, tag: Option<&'static str>) -> InstantGuard {
 /// another scope's span. Guards from [`dummy()`] (`depth: None`) never pop.
 pub struct InstantGuard {
     depth: Option<u32>,
+    // Thread-bound marker: `depth` indexes the CREATING thread's span
+    // stack — a cross-thread drop would corrupt the receiving thread's
+    // stack, so the guard must never be `Send`/`Sync`.
+    _not_send: PhantomData<*const ()>,
 }
 
 /// Construct a no-op `InstantGuard` (does nothing on drop).
 #[must_use]
 pub fn dummy() -> InstantGuard {
-    InstantGuard { depth: None }
+    InstantGuard {
+        depth: None,
+        _not_send: PhantomData,
+    }
 }
 
 impl Drop for InstantGuard {
@@ -116,6 +140,11 @@ impl Drop for InstantGuard {
     }
 }
 
+/// Number of frame boundaries retained by [`finish_frame`] before the
+/// oldest frame (and the spans it covers) is evicted — caps thread-local
+/// memory growth.
+const RETAINED_FRAMES: usize = 60;
+
 /// Mark a frame/tick boundary. Groups spans for per-tick breakdowns.
 /// Automatically drains spans older than the current frame to prevent
 /// unbounded memory growth in thread-local storage.
@@ -127,8 +156,8 @@ pub fn finish_frame() {
 
     with_tl(&FRAME_BOUNDARIES, |boundaries| {
         boundaries.push(abs);
-        if boundaries.len() > 60 {
-            let keep = boundaries.len() - 60;
+        if boundaries.len() > RETAINED_FRAMES {
+            let keep = boundaries.len() - RETAINED_FRAMES;
             let cutoff = boundaries[keep];
             // Drain spans older than the oldest retained frame. Boundaries
             // are absolute — no per-element index math, just bump the base.
@@ -152,12 +181,27 @@ pub fn drain() -> Vec<SpanRecord> {
     v
 }
 
+/// The most recent `n` finished spans WITHOUT draining (oldest→newest).
+///
+/// Snapshot for error-time breadcrumbs; the accumulator is undisturbed
+/// (unlike [`drain`], which also bumps `DRAIN_BASE`). Note the
+/// `DRAIN_BASE`/eviction interplay: `FINISHED` holds only the retained
+/// window — [`finish_frame`] drains spans older than the oldest retained
+/// frame — so a peek can only ever read what is currently buffered, never
+/// already-evicted spans. Order is finish order (innermost scopes first),
+/// i.e. the vec tail IS the most recent span.
+#[must_use]
+pub fn peek_recent(n: usize) -> Vec<SpanRecord> {
+    let mut out = Vec::new();
+    with_tl(&FINISHED, |v| {
+        let start = v.len().saturating_sub(n);
+        out.extend_from_slice(&v[start..]);
+    });
+    out
+}
+
 /// Drain frame boundaries (for per-tick grouping), rebased relative to the
 /// current `FINISHED` buffer; stale boundaries (< `DRAIN_BASE`) dropped.
-#[allow(
-    dead_code,
-    reason = "public API reserved for per-tick grouping; not used inside the crate"
-)]
 pub fn drain_frames() -> Vec<usize> {
     let base = DRAIN_BASE.with(Cell::get);
     let boundaries = FRAME_BOUNDARIES.with(Cell::take);
@@ -168,11 +212,25 @@ pub fn drain_frames() -> Vec<usize> {
         .collect()
 }
 
+/// Group spans by name, preserving each span's duration per name.
+///
+/// Shared by [`crate::breakdown::print_breakdown`] and
+/// [`crate::bench::aggregate`](crate::bench) — the one canonical
+/// group-by-name pass, so the two consumers cannot drift (they format the
+/// same groups differently: breakdown colors per-call averages, bench sums
+/// to totals).
+pub(crate) fn group_by_name(
+    spans: &[SpanRecord],
+) -> std::collections::BTreeMap<&'static str, Vec<Duration>> {
+    let mut groups: std::collections::BTreeMap<&'static str, Vec<Duration>> =
+        std::collections::BTreeMap::new();
+    for s in spans {
+        groups.entry(s.name).or_default().push(s.duration());
+    }
+    groups
+}
+
 /// Clear everything, including the drain base.
-#[allow(
-    dead_code,
-    reason = "test helper + public reset API; not used inside the crate"
-)]
 pub fn clear() {
     FINISHED.with(|c| {
         c.take();
@@ -278,12 +336,13 @@ mod tests {
             drop(enter("x", None));
             finish_frame();
         }
-        assert_eq!(drain_frames().len(), 60);
-        // Invariant implemented: eviction keeps the spans covered by the 60
-        // retained boundaries — only spans older than the oldest retained
-        // boundary are drained. Each frame here produced exactly 1 span, so
-        // 70 frames - 61 retained positions = 59 spans remain. FINISHED is
-        // NOT empty; it holds the spans of the retained window.
+        assert_eq!(drain_frames().len(), RETAINED_FRAMES);
+        // Invariant implemented: eviction keeps the spans covered by the
+        // RETAINED_FRAMES retained boundaries — only spans older than the
+        // oldest retained boundary are drained. Each frame here produced
+        // exactly 1 span, so 70 frames - (RETAINED_FRAMES + 1) retained
+        // positions = 59 spans remain. FINISHED is NOT empty; it holds the
+        // spans of the retained window.
         assert_eq!(drain().len(), 59);
     }
 

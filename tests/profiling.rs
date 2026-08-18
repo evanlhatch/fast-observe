@@ -1,5 +1,4 @@
 //! Function-scope tracking + unified `ScopeGuard` across all backends.
-//! (See MIGRATING.md for provenance.)
 
 use std::borrow::Cow;
 
@@ -196,5 +195,29 @@ mod async_tracing {
         assert!(back.is_some(), "roundtrip header must decode: {header}");
         assert_eq!(back.map(|c| c.trace_id), Some(ctx.trace_id));
         assert!(extract_traceparent("not-a-traceparent").is_none());
+    }
+
+    // ── #[instrument_async] — enter_on_poll via fastrace's own trace macro ─
+
+    #[fast_observe::instrument_async]
+    async fn instrumented_load(value: u64) -> u64 {
+        // The span is entered on poll, so the local parent is active here.
+        let _ = local_parent();
+        value
+    }
+
+    #[fast_observe::instrument_async(name = "custom.name")]
+    async fn instrumented_named(value: u64) -> u64 {
+        let _ = local_parent();
+        value
+    }
+
+    #[test]
+    fn instrument_async_enters_span_on_poll() {
+        let _root = fast_observe::root_span!("task");
+        let out = block_on(instrumented_load(7));
+        assert_eq!(out, 7);
+        let out = block_on(instrumented_named(8));
+        assert_eq!(out, 8, "named form still runs");
     }
 }
