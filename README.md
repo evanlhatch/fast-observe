@@ -158,7 +158,7 @@ Weight: what it costs your build.
 | Feature | Weight | What it wires |
 |---|---|---|
 | `instant` | tiny | thread-local span accumulator + per-phase `breakdown` (wasm-safe) |
-| `web` | tiny | browser console logs + devtools timeline marks (wasm32-unknown-unknown) |
+| `web` | tiny | level-mapped browser console logs + devtools timeline marks (wasm32-unknown-unknown) |
 | `json`, `layout-logfmt`, `layout-gcl` | tiny | stdout layouts (JSON / logfmt / Google Cloud Logging) |
 | `file` | tiny | rolling file appender via `OBSERVE_LOG_DIR` |
 | `log-syslog`, `log-journald` | light | unix syslog / systemd journald appenders |

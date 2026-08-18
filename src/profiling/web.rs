@@ -18,7 +18,11 @@ use logforth::append::Append;
 use logforth::diagnostic::Diagnostic;
 use logforth::record::Record;
 
-/// Logforth appender that forwards log records to `console.log`.
+/// Logforth appender that forwards log records to the browser console.
+/// The record's level selects the console method (`console.error` /
+/// `warn` / `info` / `debug` / `log`), so devtools severity filtering and
+/// coloring work; the message carries `target: payload` since the console
+/// shows no other metadata.
 #[derive(Debug, Default)]
 pub struct WebConsoleAppend;
 
@@ -28,8 +32,16 @@ impl Append for WebConsoleAppend {
         record: &Record,
         _diags: &[Box<dyn Diagnostic>],
     ) -> Result<(), logforth::Error> {
-        let message = record.payload().to_string();
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&message));
+        let message = format!("{}: {}", record.target(), record.payload());
+        let message = wasm_bindgen::JsValue::from_str(&message);
+        match record.level() {
+            logforth::record::Level::Error => web_sys::console::error_1(&message),
+            logforth::record::Level::Warn => web_sys::console::warn_1(&message),
+            logforth::record::Level::Info => web_sys::console::info_1(&message),
+            logforth::record::Level::Debug => web_sys::console::debug_1(&message),
+            // Trace and anything beyond it (logforth's OTel-style levels).
+            _ => web_sys::console::log_1(&message),
+        }
         Ok(())
     }
 

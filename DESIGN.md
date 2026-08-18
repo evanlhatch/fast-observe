@@ -966,6 +966,22 @@ sleep fn. Everything else was already portable or is a documentation/CI
 item — the layer-0 purity rule (no logforth/fastrace names below the
 deploy layer) is what makes that true.
 
+### Deferred wasm integrations (deliberate)
+
+- **wasi-logging** (WebAssembly/wasi-logging): a host-call log sink is the
+  right eventual shape for headless components, but the proposal is Phase
+  1 and dormant. When it moves, it lands as a `log-wasi` feature — one
+  `logforth::Append` impl (+ `TrapAppender`) on the existing seam; no
+  design change required.
+- **wasi-otel** (WebAssembly/wasi-otel): traces/metrics/logs as WASI
+  interfaces — the correct future export path for wasip3 components
+  (spans to the host's OTel pipeline, no socket). Also Phase 1. Lands as
+  `reporter-wasi-otel` (a fastrace `Reporter` over `wasi:otel/traces`).
+- **sightglass** is a benchmark harness for Wasmtime/Cranelift itself —
+  it measures the runtime, not guests, so there is nothing to integrate.
+  Guest-side benchmarking on wasm is already covered by `bench`/`instant`
+  (web-time clock).
+
 ## 11c. Nightly-mandatory feature policy (1.99 nightly)
 
 Premise: nightly is REQUIRED to consume the crate (accepted — dev tooling,
